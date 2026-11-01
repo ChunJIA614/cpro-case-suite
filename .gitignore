@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Output directories & generated files
+Output/
+*Output*/
+extracted_cases.xlsx
+cpro_availability_report.xlsx
+*.xlsx
+*.xls
+*.csv
+!test_data/*.xlsx
+
+# Temporary files
+*.tmp
+.cpro_write_test_*
+
+# Playwright & Browser artifacts
+.playwright/
+test-results/
+playwright-report/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# OS specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
