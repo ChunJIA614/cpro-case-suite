@@ -15,7 +15,7 @@ An intelligent, high-efficiency desktop application engineered for legal practit
 - [Key Features](#-key-features)
 - [Application Architecture](#-application-architecture)
   - [1. Intelligent PDF Extraction Pipeline](#1-intelligent-pdf-extraction-pipeline)
-  - [2. Multi-Account Portal Automation Cycle](#2-multi-account-portal-automation-cycle)
+  - [2. Dynamic Multi-Account Portal Automation Cycle](#2-dynamic-multi-account-portal-automation-cycle)
 - [User Interface](#-user-interface)
 - [Installation & Setup](#-installation--setup)
 - [Usage Guide](#-usage-guide)
@@ -35,16 +35,24 @@ An intelligent, high-efficiency desktop application engineered for legal practit
 Law firms acting on behalf of banking institutions frequently receive dense batches of PDF fee bills, notifications, and summons requiring cross-referencing against bank case portals. Performing this process manually presents significant challenges:
 
 1. **Repetitive Manual Data Entry**: Staff must manually copy account numbers and borrower names across dozens or hundreds of PDF pages.
-2. **Multi-Account Switching**: Firms often maintain distinct logins for branch offices or partner groups (e.g., `TOL1`, `TOL2`, `TOLMELAKA`, `TOLMELAKA01`, `TOLPUTRAJAYA`), requiring tedious repeated logins.
+2. **Multi-Account Switching**: Firms and legal departments operate under multiple distinct portal accounts (e.g., branch logins, partner credentials, or team accounts), requiring tedious repeated logins.
 3. **Multi-Section Tab Traversal**: For each account, legal clerks must check separate portal tabs: *Case In Progress*, *Case Withhold*, and *Case Withdrawn*.
 4. **Portal Instability & Concurrency Kickouts**: Bank portals often invalidate sessions unexpectedly or when an account is accessed concurrently, disrupting manual lookups.
 5. **Audit Trail Gaps**: Manual checks often lack time-stamped proof of verification across accounts.
 
-**C-PRO Case Suite** solves these challenges by combining **computer vision (OCR)**, **regular expression pattern extractors**, and **adaptive browser automation** into a unified, high-DPI desktop application.
+**C-PRO Case Suite** solves these challenges by combining **computer vision (OCR)**, **regular expression pattern extractors**, and **adaptive browser automation** into a unified, high-DPI desktop application with **fully customizable, user-defined account management**.
 
 ---
 
 ## 🚀 Key Features
+
+### 👤 Dynamic User-Entered Account Management
+- **No Hardcoded Accounts**: Enter any C-PRO username and session password directly in the interface. Not locked to fixed account names.
+- **Dynamic Account List**: Add as many accounts as your organization requires via the `＋ Add Account` button.
+- **Individual Enable / Disable Controls**: Easily toggle specific accounts on or off using checkboxes before running searches.
+- **One-Click Deletion**: Remove unwanted account entries with a single click (`✕`).
+- **Safe Username Persistence**: Configured usernames and their enabled states are saved locally (`cpro_saved_accounts.json`), eliminating the need to retype usernames every session.
+- **Strict In-Memory Password Protection**: Passwords remain exclusively in runtime RAM and are **never** written to disk or configuration files.
 
 ### 🔍 Intelligent Dual-Engine PDF Extractor
 - **High-Speed Native Extraction**: Quickly extracts text layers from digital PDFs using `PyMuPDF` (`fitz`).
@@ -52,9 +60,8 @@ Law firms acting on behalf of banking institutions frequently receive dense batc
 - **Malaysian Banking Pattern Matching**: Accurately isolates loan account formats (e.g., `UPL-2611339-39596078602`, `MG-2611300-26791032594`).
 - **Heuristic Borrower Name Normalization**: Extracts borrower names while filtering out legal fee headers, SV-8 codes, document numbers, and trimming titles (`BIN`, `BINTI`, `A/L`, `A/P`, `@`) to generate clean portal search keys.
 
-### 🌐 Multi-Branch & Multi-Section Automation Engine
-- **Multi-Login Support**: Handles multiple branch credentials (`TOL1`, `TOL2`, `TOLMELAKA`, `TOLMELAKA01`, `TOLPUTRAJAYA`) with paired account redundancy.
-- **Section Selection**: Concurrently filters through:
+### 🌐 Multi-Section Automation Engine
+- **Configurable Section Traversal**: Concurrently filters through:
   - *Case In Progress*
   - *Case Withhold*
   - *Case Withdrawn*
@@ -71,14 +78,14 @@ Law firms acting on behalf of banking institutions frequently receive dense batc
 
 ### 📊 Resilient Dual-View Excel Reporting
 - **Two Comprehensive Worksheets**:
-  1. `Summary_Report`: High-level overview of every case, availability flag, and matching section.
-  2. `All_Checks_Detail`: Granular audit log showing exact timestamps, credentials utilized, sections checked, search query used, and verbatim DevExtreme grid row text.
+  1. `Summary_Report`: High-level overview of every case, availability flag, and matching user account / section.
+  2. `All_Checks_Detail`: Granular audit log showing exact timestamps, user accounts utilized, sections checked, search query used, and verbatim DevExtreme grid row text.
 - **Lock-Resistant Fallback System**: If Microsoft Excel has locked an existing output workbook, the suite automatically falls back to timestamped filenames across safe directories (`Desktop`, `Documents`, `AppData`, or `Temp`), ensuring no data loss.
 
 ### 🎨 Apple Human Interface Design Desktop Experience
 - Designed with Apple Human Interface Guidelines: crisp neutral palettes, rounded cards, subtle border radiuses, and dynamic status badges.
 - **Native High-DPI Scaling**: Crisp typography and controls on modern 2K/4K Windows displays using `SetProcessDpiAwareness`.
-- **In-Memory Credential Security**: Passwords remain exclusively in RAM during runtime and are purged upon app termination.
+- **Integrated Scrollable Containers**: Smooth mousewheel-scrollable account manager that scales gracefully regardless of whether you configure 1 account or 15.
 
 ---
 
@@ -101,13 +108,13 @@ flowchart TD
 
 ---
 
-### 2. Multi-Account Portal Automation Cycle
+### 2. Dynamic Multi-Account Portal Automation Cycle
 
 ```mermaid
 flowchart TD
     A["Start Verification Engine"] --> B["Launch Playwright Chromium (Live/Headless)"]
-    B --> C["Select Next Configured Account (e.g. TOL1)"]
-    C --> D["Submit Sign-In Credentials"]
+    B --> C["Select Next Enabled User-Defined Account"]
+    C --> D["Submit Sign-In Credentials (Username + Password)"]
     D --> E{"Login Rejected / Invalid Password?"}
     E -- Yes --> F["Prompt User for Correct Password\n(Prevent Lockout)"]
     F --> D
@@ -121,12 +128,12 @@ flowchart TD
     M -- Yes --> N["Auto Re-login & Restore Section Tab"]
     N --> L
     M -- No --> O["Scan Matching Grid Rows"]
-    O --> P["Record Findings (Status, Section, Row Details)"]
+    O --> P["Record Findings (Status, User Account, Section, Row Details)"]
     P --> Q{"More Cases in Queue?"}
     Q -- Yes --> I
     Q -- No --> R{"More Sections to Check?"}
     R -- Yes --> G
-    R -- No --> S{"More Accounts Configured?"}
+    R -- No --> S{"More Enabled Accounts in List?"}
     S -- Yes --> C
     S -- No --> T["Compile Summary & Detailed Audit Log"]
     T --> U["Write Formatted Excel Workbook\n(cpro_availability_report.xlsx)"]
@@ -140,7 +147,11 @@ The desktop GUI is divided into clear functional zones:
 
 1. **Header Bar**: Displays application identity and a dynamic status badge (`Ready`, `Extracting PDFs...`, `Checking C-PRO...`, `Stopping...`).
 2. **Left Sidebar**:
-   - **Session Passwords**: Quick toggles and password entry fields for `TOL1`, `TOL2`, `TOLMELAKA`, `TOLMELAKA01`, and `TOLPUTRAJAYA`. Includes a "Show Passwords" toggle.
+   - **C-PRO Accounts (Dynamic)**:
+     - Scrollable list of custom account cards.
+     - Each card contains an enable checkbox, Username entry, session Password entry (`•`), and a delete button (`✕`).
+     - **`＋ Add Account`** button to dynamically add new account cards.
+     - **`Show Passwords`** toggle to reveal/hide typed passwords.
    - **Sections to Check**: Checkboxes for *Case In Progress*, *Case Withhold*, and *Case Withdrawn*.
    - **Search Strategy**: Radio selector for fallback behavior.
    - **Live Browser Toggle**: Option to view or hide Chromium during automation.
@@ -200,6 +211,8 @@ playwright install chromium
   ```bash
   python cpro_suite_app.py
   ```
+  *(or `py cpro_suite_app.py` on Windows)*
+
 - **Via Windows Launcher**:
   Double-click `run.bat` in the repository root folder.
 
@@ -211,12 +224,15 @@ playwright install chromium
    - *Alternative*: Click **`＋ Add Manual Row`** to type an individual account directly.
 2. **Review & Adjust**:
    - Double-click any row in the queue table to manually correct an account number or borrower name before executing searches.
-3. **Configure Sidebar Credentials & Options**:
-   - Enter your C-PRO passwords for the branches you want to verify.
+3. **Enter Your Accounts & Passwords**:
+   - In the **C-PRO ACCOUNTS** sidebar section, enter your C-PRO username(s) and password(s).
+   - Click **`＋ Add Account`** to add additional accounts, or click **`✕`** to remove accounts.
+   - Uncheck any account you wish to skip for the current run.
    - Select your target sections (e.g., *Case In Progress*).
    - Select your desired search strategy (default: *Account No → Fallback to Name*).
 4. **Run Automation**:
    - Click **`▶ Start C-PRO Check`**.
+   - If any enabled account is missing a password, a prompt will appear asking for it.
    - Monitor live progress in the activity log and queue table.
 5. **View Results**:
    - Once completed, the output folder will open automatically.
@@ -237,13 +253,13 @@ Provides an executive overview of all checked cases:
 | `Search Name` | Cleaned primary borrower search string |
 | `Full Borrower Name` | Complete extracted borrower name |
 | `Availability Status` | `AVAILABLE`, `NOT FOUND`, or `CHECK ERROR` |
-| `Found In Account(s)` | Which law firm branch account(s) held the case |
-| `Found In Section(s)` | Specific portal section tabs (e.g., `TOL1: Case In Progress`) |
+| `Found In Account(s)` | Which user account(s) held the case (e.g., `USER_A, USER_B`) |
+| `Found In Section(s)` | Specific portal section tabs (e.g., `USER_A: Case In Progress`) |
 | `C-PRO Row Details` | Key details extracted from matching DevExtreme grid row |
 
 ### Sheet 2: `All_Checks_Detail`
 Maintains an exhaustive, timestamped audit log of every query attempted:
-- Records individual search terms, exact account credentials used, target sections, matching method (`Account No` vs `Borrower Name`), and verbatim grid row contents.
+- Records individual search terms, exact user accounts utilized, target sections, matching method (`Account No` vs `Borrower Name`), and verbatim grid row contents.
 
 ---
 
@@ -276,7 +292,8 @@ The suite wraps all save routines with `_write_with_fallback()`:
 ## 🔒 Security & Compliance
 
 - **No Remote Credential Transmission**: Passwords and case details are processed exclusively between your local machine and the official Hong Leong Bank portal.
-- **In-Memory Credential Lifespan**: All credentials entered into the GUI reside strictly in memory and are discarded when the application window is closed. No passwords are saved in config files, logs, or plain text on disk.
+- **In-Memory Credential Lifespan**: All passwords entered into the GUI reside strictly in memory and are discarded when the application window is closed. No passwords are ever saved to disk.
+- **Non-Sensitive Config Storage**: Only account usernames and their enabled states are saved to `cpro_saved_accounts.json` for user convenience.
 - **Local OCR & Processing**: Text extraction and OCR are executed locally on CPU/ONNX Runtime without uploading legal documents to third-party cloud APIs.
 
 ---
@@ -287,6 +304,7 @@ The suite wraps all save routines with `_write_with_fallback()`:
 | :--- | :--- | :--- |
 | **Playwright Missing Error** | Browser binaries not installed | Run `playwright install chromium` in your activated Python environment. |
 | **Grid Load Timeout Error** | Slow portal network response | Verify your internet connection. Check if HLB C-PRO portal is under maintenance. |
+| **Missing Username Warning** | An account card is enabled without a username | Enter a username for the account, or uncheck / remove it (`✕`). |
 | **Login Rejected / Invalid Password** | Incorrect password for account | The app will prompt you to enter the correct password. Ensure you are using the active C-PRO credentials. |
 | **Output File Locked** | Excel file is open in Microsoft Excel | Close the file in Excel, or find the fallback report in the opened output folder. |
 | **PDF Extraction Misses Name** | Unusual formatting in PDF | Double-click the row in the Cases Queue to manually edit the search name before starting the check. |

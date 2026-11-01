@@ -250,18 +250,9 @@ class CProSuiteApp:
         self.last_report_path = REPORT_EXCEL
         self._last_searched_column = None
 
-        self.pwd_tol1 = tk.StringVar()
-        self.pwd_tol2 = tk.StringVar()
-        self.pwd_melaka = tk.StringVar()
-        self.pwd_melaka01 = tk.StringVar()
-        self.pwd_putrajaya = tk.StringVar()
+        self.accounts = []
         self.show_pwd = tk.BooleanVar(value=False)
-
-        self.enable_tol1 = tk.BooleanVar(value=True)
-        self.enable_tol2 = tk.BooleanVar(value=False)
-        self.enable_melaka = tk.BooleanVar(value=True)
-        self.enable_melaka01 = tk.BooleanVar(value=False)
-        self.enable_putrajaya = tk.BooleanVar(value=True)
+        self.accounts_config_path = os.path.join(OUTPUT_DIR, "cpro_saved_accounts.json")
 
         self.sec_in_progress = tk.BooleanVar(value=True)
         self.sec_withhold = tk.BooleanVar(value=True)
@@ -272,6 +263,7 @@ class CProSuiteApp:
 
         self._configure_styles()
         self._build_layout()
+        self._load_saved_accounts()
         self.log(f"Output folder: {OUTPUT_DIR}")
         self._auto_load_existing_excel()
 
@@ -324,32 +316,64 @@ class CProSuiteApp:
     def _build_sidebar(self, sidebar):
         card1_outer, card1 = self._create_card(sidebar)
         card1_outer.pack(fill="x", pady=(0, 14))
-        tk.Label(card1, text="SESSION PASSWORDS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w")
-        tk.Label(card1, text="Passwords stay in memory until the app closes.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=280, justify="left").pack(anchor="w", pady=(2, 10))
+        tk.Label(card1, text="C-PRO ACCOUNTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w")
+        tk.Label(card1, text="Enter your C-PRO usernames & session passwords.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=280, justify="left").pack(anchor="w", pady=(2, 8))
 
-        self.pwd_entries = []
-        accounts_ui = [
-            ("TOL1 (shared group with TOL2)", self.pwd_tol1, self.enable_tol1),
-            ("TOL2 (alternative to TOL1)", self.pwd_tol2, self.enable_tol2),
-            ("TOLMELAKA (shared group with 01)", self.pwd_melaka, self.enable_melaka),
-            ("TOLMELAKA01 (alternative to Melaka)", self.pwd_melaka01, self.enable_melaka01),
-            ("TOLPUTRAJAYA", self.pwd_putrajaya, self.enable_putrajaya),
-        ]
-        for label_text, pwd_var, enable_var in accounts_ui:
-            row_header = tk.Frame(card1, bg=THEME["card"])
-            row_header.pack(fill="x", pady=(4, 2))
-            tk.Checkbutton(row_header, text=label_text, variable=enable_var, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI Semibold", 9)).pack(side="left")
-            entry_border = tk.Frame(card1, bg=THEME["border"], padx=1, pady=1)
-            entry_border.pack(fill="x", pady=(0, 6))
-            ent = tk.Entry(entry_border, textvariable=pwd_var, show="•", bg=THEME["input_bg"], fg=THEME["text"], relief="flat", bd=5, font=("Segoe UI", 9))
-            ent.pack(fill="x")
-            self.pwd_entries.append(ent)
+        # Scrollable container for dynamic accounts
+        accounts_container = tk.Frame(card1, bg=THEME["card"])
+        accounts_container.pack(fill="x", expand=True)
+
+        self.accounts_canvas = tk.Canvas(accounts_container, bg=THEME["card"], highlightthickness=0, height=200)
+        self.accounts_vsb = ttk.Scrollbar(accounts_container, orient="vertical", command=self.accounts_canvas.yview)
+        self.accounts_scroll_frame = tk.Frame(self.accounts_canvas, bg=THEME["card"])
+
+        self.accounts_scroll_frame.bind(
+            "<Configure>",
+            lambda e: self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
+        )
+        self.accounts_canvas_window = self.accounts_canvas.create_window((0, 0), window=self.accounts_scroll_frame, anchor="nw")
+        self.accounts_canvas.bind(
+            "<Configure>",
+            lambda e: self.accounts_canvas.itemconfig(self.accounts_canvas_window, width=e.width)
+        )
+        self.accounts_canvas.configure(yscrollcommand=self.accounts_vsb.set)
+
+        self.accounts_canvas.pack(side="left", fill="both", expand=True)
+        self.accounts_vsb.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            self.accounts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.accounts_canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.accounts_scroll_frame.bind("<MouseWheel>", _on_mousewheel)
+
+        acc_actions = tk.Frame(card1, bg=THEME["card"])
+        acc_actions.pack(fill="x", pady=(8, 0))
+
+        self.btn_add_acc = self._create_button(
+            acc_actions,
+            "＋ Add Account",
+            lambda: self._add_account_row(),
+            bg=THEME["neutral_btn"],
+            fg=THEME["text"],
+            hover_bg=THEME["neutral_hover"]
+        )
+        self.btn_add_acc.pack(side="left")
 
         def toggle_pwd_visibility():
             char = "" if self.show_pwd.get() else "•"
-            for e in self.pwd_entries: e.config(show=char)
+            for acc in self.accounts:
+                acc["ent_pwd"].config(show=char)
 
-        tk.Checkbutton(card1, text="Show Passwords", variable=self.show_pwd, command=toggle_pwd_visibility, bg=THEME["card"], fg=THEME["subtext"], activebackground=THEME["card"], font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
+        tk.Checkbutton(
+            acc_actions,
+            text="Show Passwords",
+            variable=self.show_pwd,
+            command=toggle_pwd_visibility,
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            activebackground=THEME["card"],
+            font=("Segoe UI", 8)
+        ).pack(side="right", padx=(4, 0))
 
         card2_outer, card2 = self._create_card(sidebar)
         card2_outer.pack(fill="x", pady=(0, 14))
@@ -375,6 +399,137 @@ class CProSuiteApp:
         
         # NEW BUTTON TO OPEN OUTPUT FOLDER
         self._create_button(card3, "📂 Open Output Folder", lambda: self._open_folder(OUTPUT_DIR), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x")
+
+    def _add_account_row(self, username="", enabled=True):
+        idx = len(self.accounts) + 1
+        user_var = tk.StringVar(value=username)
+        pwd_var = tk.StringVar()
+        enable_var = tk.BooleanVar(value=enabled)
+
+        card = tk.Frame(self.accounts_scroll_frame, bg=THEME["card"], pady=2)
+        card.pack(fill="x", expand=True, pady=(0, 6))
+
+        box = tk.Frame(card, bg="#F9F9FB", padx=8, pady=6, highlightbackground=THEME["border"], highlightthickness=1)
+        box.pack(fill="x", expand=True)
+
+        top_line = tk.Frame(box, bg="#F9F9FB")
+        top_line.pack(fill="x", pady=(0, 2))
+
+        chk = tk.Checkbutton(
+            top_line,
+            text=f"Account #{idx}",
+            variable=enable_var,
+            bg="#F9F9FB",
+            fg=THEME["text"],
+            activebackground="#F9F9FB",
+            font=("Segoe UI Semibold", 8)
+        )
+        chk.pack(side="left")
+
+        del_btn = tk.Label(
+            top_line,
+            text="✕",
+            bg="#F9F9FB",
+            fg=THEME["subtext"],
+            cursor="hand2",
+            font=("Segoe UI", 9)
+        )
+        del_btn.pack(side="right")
+
+        # Username row
+        u_box = tk.Frame(box, bg="#F9F9FB")
+        u_box.pack(fill="x", pady=(1, 3))
+        tk.Label(u_box, text="Username:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
+        u_border = tk.Frame(u_box, bg=THEME["border"], padx=1, pady=1)
+        u_border.pack(fill="x")
+        ent_user = tk.Entry(u_border, textvariable=user_var, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=3, font=("Segoe UI", 8))
+        ent_user.pack(fill="x")
+
+        # Password row
+        p_box = tk.Frame(box, bg="#F9F9FB")
+        p_box.pack(fill="x", pady=(1, 2))
+        tk.Label(p_box, text="Password:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
+        p_border = tk.Frame(p_box, bg=THEME["border"], padx=1, pady=1)
+        p_border.pack(fill="x")
+        show_char = "" if self.show_pwd.get() else "•"
+        ent_pwd = tk.Entry(p_border, textvariable=pwd_var, show=show_char, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=3, font=("Segoe UI", 8))
+        ent_pwd.pack(fill="x")
+
+        acc_obj = {
+            "user": user_var,
+            "pwd": pwd_var,
+            "enabled": enable_var,
+            "card": card,
+            "chk": chk,
+            "ent_pwd": ent_pwd,
+            "del_btn": del_btn
+        }
+
+        del_btn.bind("<Button-1>", lambda e, a=acc_obj: self._remove_account_row(a))
+        del_btn.bind("<Enter>", lambda e, b=del_btn: b.config(fg=THEME["red"]))
+        del_btn.bind("<Leave>", lambda e, b=del_btn: b.config(fg=THEME["subtext"]))
+
+        for w in (card, box, top_line, chk, u_box, p_box, ent_user, ent_pwd):
+            w.bind("<MouseWheel>", lambda e: self.accounts_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+
+        self.accounts.append(acc_obj)
+        self._refresh_account_indices()
+        self.accounts_canvas.update_idletasks()
+        self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
+
+    def _remove_account_row(self, acc_obj):
+        if len(self.accounts) <= 1:
+            acc_obj["user"].set("")
+            acc_obj["pwd"].set("")
+            acc_obj["enabled"].set(True)
+            return
+        acc_obj["card"].destroy()
+        self.accounts.remove(acc_obj)
+        self._refresh_account_indices()
+        self.accounts_canvas.update_idletasks()
+        self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
+        self._save_accounts_config()
+
+    def _refresh_account_indices(self):
+        for idx, acc in enumerate(self.accounts, start=1):
+            acc["chk"].config(text=f"Account #{idx}")
+
+    def _load_saved_accounts(self):
+        saved_list = []
+        if os.path.isfile(self.accounts_config_path):
+            try:
+                import json
+                with open(self.accounts_config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        saved_list = data
+            except Exception as e:
+                self.log(f"Could not load saved accounts: {e}")
+
+        if not saved_list:
+            saved_list = [
+                {"username": "", "enabled": True},
+                {"username": "", "enabled": False}
+            ]
+
+        for item in saved_list:
+            u = item.get("username", "") if isinstance(item, dict) else str(item)
+            en = item.get("enabled", True) if isinstance(item, dict) else True
+            self._add_account_row(username=u, enabled=en)
+
+    def _save_accounts_config(self):
+        data = []
+        for acc in self.accounts:
+            u = acc["user"].get().strip()
+            if u:
+                data.append({"username": u, "enabled": acc["enabled"].get()})
+        try:
+            import json
+            os.makedirs(os.path.dirname(self.accounts_config_path), exist_ok=True)
+            with open(self.accounts_config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.log(f"Notice: Could not save accounts configuration: {e}")
 
     def _build_content_area(self, content):
         bar_outer, bar = self._create_card(content, padx=14, pady=12)
@@ -761,29 +916,31 @@ class CProSuiteApp:
             return
 
         active_accounts = []
-        def add_one_from_group(primary_enabled, primary_name, primary_password, alias_enabled, alias_name, alias_password, group_label):
-            chosen = None
-            if primary_enabled.get(): chosen = (primary_name, primary_password)
-            elif alias_enabled.get(): chosen = (alias_name, alias_password)
-            if chosen:
-                username, password_var = chosen
-                active_accounts.append({"group_label": group_label, "username": username, "password": password_var.get().strip(), "password_var": password_var})
-
-        add_one_from_group(self.enable_tol1, "TOL1", self.pwd_tol1, self.enable_tol2, "TOL2", self.pwd_tol2, "TOL1 / TOL2")
-        add_one_from_group(self.enable_melaka, "TOLMELAKA", self.pwd_melaka, self.enable_melaka01, "TOLMELAKA01", self.pwd_melaka01, "TOLMELAKA / TOLMELAKA01")
-        if self.enable_putrajaya.get():
-            active_accounts.append({"group_label": "TOLPUTRAJAYA", "username": "TOLPUTRAJAYA", "password": self.pwd_putrajaya.get().strip(), "password_var": self.pwd_putrajaya})
+        for idx, acc in enumerate(self.accounts, start=1):
+            if acc["enabled"].get():
+                username = acc["user"].get().strip()
+                password = acc["pwd"].get().strip()
+                if not username:
+                    messagebox.showwarning("Missing Username", f"Account #{idx} is enabled but has no username.\n\nPlease enter a username or uncheck/remove it.", parent=self.root)
+                    return
+                active_accounts.append({
+                    "username": username,
+                    "password": password,
+                    "password_var": acc["pwd"]
+                })
 
         if not active_accounts:
-            messagebox.showwarning("No Accounts Selected", "Please select at least one C-PRO account in the left sidebar.")
+            messagebox.showwarning("No Accounts Selected", "Please enter and enable at least one C-PRO account in the left sidebar.", parent=self.root)
             return
 
         for acc in active_accounts:
             if not acc["password"]:
-                pwd = simpledialog.askstring("Password Required", f"Enter C-PRO password for {acc['username']}:", show="•", parent=self.root)
+                pwd = simpledialog.askstring("Password Required", f"Enter C-PRO password for '{acc['username']}':", show="•", parent=self.root)
                 if not pwd: return
                 acc["password"] = pwd.strip()
                 acc["password_var"].set(acc["password"])
+
+        self._save_accounts_config()
 
         active_sections = []
         if self.sec_in_progress.get(): active_sections.append("Case In Progress")
@@ -1341,9 +1498,8 @@ class CProSuiteApp:
 
                 for acc in active_accounts:
                     if self.stop_requested: break
-                    group_label = acc["group_label"]
                     username = acc["username"]
-                    self.log(f"=== Starting Account: {username} ({group_label}) ===")
+                    self.log(f"=== Starting Account: {username} ===")
 
                     context = browser.new_context()
                     page = context.new_page()
@@ -1410,7 +1566,7 @@ class CProSuiteApp:
 
                                 if matched_data:
                                     self.log(f"  ✓ FOUND by {matched_by}: {search_name or acc_no} in {username} -> {section}")
-                                    found_tracker[idx]["accounts"].append(group_label)
+                                    found_tracker[idx]["accounts"].append(username)
                                     found_tracker[idx]["sections"].append(f"{username}: {section}")
                                     found_tracker[idx]["details"].extend(matched_data)
 
@@ -1421,13 +1577,13 @@ class CProSuiteApp:
 
                                     for r_str in matched_data:
                                         detailed_log.append({
-                                            "Account No": acc_no, "Search Name": search_name, "C-PRO Account Group": group_label,
+                                            "Account No": acc_no, "Search Name": search_name, "C-PRO Account": username,
                                             "Login Used": username, "Section": section, "Status": "AVAILABLE", "Matched By": matched_by, "C-PRO Row Details": r_str
                                         })
                                 else:
                                     self.log(f"  ✗ NOT FOUND: {search_name or acc_no or '(no search value)'} in {username} -> {section}")
                                     detailed_log.append({
-                                        "Account No": acc_no, "Search Name": search_name, "C-PRO Account Group": group_label,
+                                        "Account No": acc_no, "Search Name": search_name, "C-PRO Account": username,
                                         "Login Used": username, "Section": section, "Status": "Not Found", "Matched By": "-", "C-PRO Row Details": "-"
                                     })
 
