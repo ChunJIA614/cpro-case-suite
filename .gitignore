@@ -49,3 +49,8 @@ $RECYCLE.BIN/
 
 # Logs
 *.log
+
+# User local configs
+cpro_saved_accounts.json
+
+*.log

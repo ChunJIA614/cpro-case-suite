@@ -238,8 +238,8 @@ class CProSuiteApp:
     def __init__(self, root):
         self.root = root
         self.root.title("C-PRO Case Suite")
-        self.root.geometry("1280x820")
-        self.root.minsize(1080, 700)
+        self.root.geometry("1340x840")
+        self.root.minsize(1120, 720)
         self.root.configure(bg=THEME["bg"])
 
         self.pdf_engine = PDFExtractorEngine()
@@ -275,14 +275,14 @@ class CProSuiteApp:
         style.map("Apple.Treeview", background=[("selected", "#D8EAFE")], foreground=[("selected", THEME["text"])])
         style.configure("Apple.Horizontal.TProgressbar", troughcolor="#E5E5EA", background=THEME["blue"], bordercolor="#E5E5EA", lightcolor=THEME["blue"], darkcolor=THEME["blue"], thickness=6)
 
-    def _create_card(self, parent, padx=18, pady=16):
+    def _create_card(self, parent, padx=14, pady=12):
         outer = tk.Frame(parent, bg=THEME["border"], padx=1, pady=1)
         inner = tk.Frame(outer, bg=THEME["card"], padx=padx, pady=pady)
         inner.pack(fill="both", expand=True)
         return outer, inner
 
     def _create_button(self, parent, text, command, bg, fg="#FFFFFF", hover_bg=None, width=None):
-        btn = tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=hover_bg or bg, activeforeground=fg, relief="flat", bd=0, padx=14, pady=7, cursor="hand2", font=("Segoe UI Semibold", 9))
+        btn = tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=hover_bg or bg, activeforeground=fg, relief="flat", bd=0, padx=10, pady=7, cursor="hand2", font=("Segoe UI Semibold", 9))
         if width: btn.config(width=width)
         if hover_bg:
             btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg) if btn["state"] != "disabled" else None)
@@ -302,11 +302,38 @@ class CProSuiteApp:
         self.status_badge = tk.Label(status_frame, text="●  Ready", font=("Segoe UI Semibold", 9), bg="#E8E8ED", fg=THEME["text"], padx=12, pady=5)
         self.status_badge.pack(side="right")
 
-        workspace = tk.Frame(self.root, bg=THEME["bg"], padx=24, pady=4)
+        workspace = tk.Frame(self.root, bg=THEME["bg"], padx=20, pady=4)
         workspace.pack(fill="both", expand=True)
-        sidebar = tk.Frame(workspace, bg=THEME["bg"], width=330)
-        sidebar.pack(side="left", fill="y", padx=(0, 16))
-        sidebar.pack_propagate(False)
+
+        # Scrollable Sidebar Container
+        sidebar_container = tk.Frame(workspace, bg=THEME["bg"], width=420)
+        sidebar_container.pack(side="left", fill="y", padx=(0, 16))
+        sidebar_container.pack_propagate(False)
+
+        self.sidebar_canvas = tk.Canvas(sidebar_container, bg=THEME["bg"], highlightthickness=0)
+        self.sidebar_vsb = ttk.Scrollbar(sidebar_container, orient="vertical", command=self.sidebar_canvas.yview)
+        sidebar = tk.Frame(self.sidebar_canvas, bg=THEME["bg"])
+
+        sidebar.bind(
+            "<Configure>",
+            lambda e: self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
+        )
+        self.sidebar_window = self.sidebar_canvas.create_window((0, 0), window=sidebar, anchor="nw")
+        self.sidebar_canvas.bind(
+            "<Configure>",
+            lambda e: self.sidebar_canvas.itemconfig(self.sidebar_window, width=e.width)
+        )
+        self.sidebar_canvas.configure(yscrollcommand=self.sidebar_vsb.set)
+
+        self.sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self.sidebar_vsb.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            self.sidebar_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        sidebar_container.bind("<Enter>", lambda e: self.sidebar_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        sidebar_container.bind("<Leave>", lambda e: self.sidebar_canvas.unbind_all("<MouseWheel>"))
+
         self._build_sidebar(sidebar)
 
         content = tk.Frame(workspace, bg=THEME["bg"])
@@ -315,49 +342,13 @@ class CProSuiteApp:
 
     def _build_sidebar(self, sidebar):
         card1_outer, card1 = self._create_card(sidebar)
-        card1_outer.pack(fill="x", pady=(0, 14))
+        card1_outer.pack(fill="x", pady=(0, 12))
         tk.Label(card1, text="C-PRO ACCOUNTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w")
-        tk.Label(card1, text="Enter your C-PRO usernames & session passwords.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=280, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(card1, text="Enter your C-PRO usernames & session passwords.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=340, justify="left").pack(anchor="w", pady=(2, 8))
 
-        # Scrollable container for dynamic accounts
-        accounts_container = tk.Frame(card1, bg=THEME["card"])
-        accounts_container.pack(fill="x", expand=True)
-
-        self.accounts_canvas = tk.Canvas(accounts_container, bg=THEME["card"], highlightthickness=0, height=200)
-        self.accounts_vsb = ttk.Scrollbar(accounts_container, orient="vertical", command=self.accounts_canvas.yview)
-        self.accounts_scroll_frame = tk.Frame(self.accounts_canvas, bg=THEME["card"])
-
-        self.accounts_scroll_frame.bind(
-            "<Configure>",
-            lambda e: self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
-        )
-        self.accounts_canvas_window = self.accounts_canvas.create_window((0, 0), window=self.accounts_scroll_frame, anchor="nw")
-        self.accounts_canvas.bind(
-            "<Configure>",
-            lambda e: self.accounts_canvas.itemconfig(self.accounts_canvas_window, width=e.width)
-        )
-        self.accounts_canvas.configure(yscrollcommand=self.accounts_vsb.set)
-
-        self.accounts_canvas.pack(side="left", fill="both", expand=True)
-        self.accounts_vsb.pack(side="right", fill="y")
-
-        def _on_mousewheel(event):
-            self.accounts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        self.accounts_canvas.bind("<MouseWheel>", _on_mousewheel)
-        self.accounts_scroll_frame.bind("<MouseWheel>", _on_mousewheel)
-
-        acc_actions = tk.Frame(card1, bg=THEME["card"])
-        acc_actions.pack(fill="x", pady=(8, 0))
-
-        self.btn_add_acc = self._create_button(
-            acc_actions,
-            "＋ Add Account",
-            lambda: self._add_account_row(),
-            bg=THEME["neutral_btn"],
-            fg=THEME["text"],
-            hover_bg=THEME["neutral_hover"]
-        )
-        self.btn_add_acc.pack(side="left")
+        # Container frame for account cards
+        self.accounts_list_frame = tk.Frame(card1, bg=THEME["card"])
+        self.accounts_list_frame.pack(fill="x", expand=True)
 
         def toggle_pwd_visibility():
             char = "" if self.show_pwd.get() else "•"
@@ -365,39 +356,52 @@ class CProSuiteApp:
                 acc["ent_pwd"].config(show=char)
 
         tk.Checkbutton(
-            acc_actions,
+            card1,
             text="Show Passwords",
             variable=self.show_pwd,
             command=toggle_pwd_visibility,
             bg=THEME["card"],
             fg=THEME["subtext"],
             activebackground=THEME["card"],
-            font=("Segoe UI", 8)
-        ).pack(side="right", padx=(4, 0))
+            font=("Segoe UI", 8),
+            anchor="w"
+        ).pack(fill="x", pady=(6, 4))
+
+        self.btn_add_acc = self._create_button(
+            card1,
+            "＋ Add Account",
+            lambda: self._add_account_row(),
+            bg=THEME["neutral_btn"],
+            fg=THEME["text"],
+            hover_bg=THEME["neutral_hover"]
+        )
+        self.btn_add_acc.pack(fill="x")
 
         card2_outer, card2 = self._create_card(sidebar)
-        card2_outer.pack(fill="x", pady=(0, 14))
-        tk.Label(card2, text="SECTIONS TO CHECK", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 6))
+        card2_outer.pack(fill="x", pady=(0, 12))
+        tk.Label(card2, text="SECTIONS TO CHECK", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 4))
         for sec_label, sec_var in [("Case In Progress", self.sec_in_progress), ("Case Withhold", self.sec_withhold), ("Case Withdrawn", self.sec_withdrawn)]:
-            tk.Checkbutton(card2, text=sec_label, variable=sec_var, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9)).pack(anchor="w", pady=1)
+            tk.Checkbutton(card2, text=sec_label, variable=sec_var, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9), anchor="w").pack(fill="x", pady=1)
 
-        tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=10)
-        tk.Label(card2, text="SEARCH STRATEGY", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 6))
-        modes = [("Account No → Fallback to Name", "ACCOUNT_THEN_NAME"), ("Account No Only", "ACCOUNT_ONLY"), ("Borrower Name Only", "NAME_ONLY")]
+        tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=8)
+        tk.Label(card2, text="SEARCH STRATEGY", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 4))
+        modes = [
+            ("Account No → Fallback to Name", "ACCOUNT_THEN_NAME"),
+            ("Account No Only", "ACCOUNT_ONLY"),
+            ("Borrower Name Only", "NAME_ONLY")
+        ]
         for text, val in modes:
-            tk.Radiobutton(card2, text=text, variable=self.search_mode, value=val, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9)).pack(anchor="w", pady=1)
+            tk.Radiobutton(card2, text=text, variable=self.search_mode, value=val, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9), anchor="w", justify="left").pack(fill="x", pady=1)
 
-        tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=10)
-        tk.Checkbutton(card2, text="Show Live Chrome Browser", variable=self.show_browser, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=8)
+        tk.Checkbutton(card2, text="Show Live Chrome Browser", variable=self.show_browser, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9), anchor="w").pack(fill="x")
 
         card3_outer, card3 = self._create_card(sidebar)
-        card3_outer.pack(fill="x")
-        tk.Label(card3, text="EXCEL FILES", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 8))
+        card3_outer.pack(fill="x", pady=(0, 12))
+        tk.Label(card3, text="EXCEL FILES & REPORTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 8))
         
         self._create_button(card3, "Open Extracted Cases Excel", lambda: self._open_file(getattr(self, "last_extracted_path", EXTRACTED_EXCEL)), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
         self._create_button(card3, "Open Final C-PRO Report Excel", lambda: self._open_file(getattr(self, "last_report_path", REPORT_EXCEL)), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
-        
-        # NEW BUTTON TO OPEN OUTPUT FOLDER
         self._create_button(card3, "📂 Open Output Folder", lambda: self._open_folder(OUTPUT_DIR), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x")
 
     def _add_account_row(self, username="", enabled=True):
@@ -406,14 +410,14 @@ class CProSuiteApp:
         pwd_var = tk.StringVar()
         enable_var = tk.BooleanVar(value=enabled)
 
-        card = tk.Frame(self.accounts_scroll_frame, bg=THEME["card"], pady=2)
+        card = tk.Frame(self.accounts_list_frame, bg=THEME["card"])
         card.pack(fill="x", expand=True, pady=(0, 6))
 
-        box = tk.Frame(card, bg="#F9F9FB", padx=8, pady=6, highlightbackground=THEME["border"], highlightthickness=1)
+        box = tk.Frame(card, bg="#F9F9FB", padx=10, pady=8, highlightbackground=THEME["border"], highlightthickness=1)
         box.pack(fill="x", expand=True)
 
         top_line = tk.Frame(box, bg="#F9F9FB")
-        top_line.pack(fill="x", pady=(0, 2))
+        top_line.pack(fill="x", pady=(0, 4))
 
         chk = tk.Checkbutton(
             top_line,
@@ -422,17 +426,18 @@ class CProSuiteApp:
             bg="#F9F9FB",
             fg=THEME["text"],
             activebackground="#F9F9FB",
-            font=("Segoe UI Semibold", 8)
+            font=("Segoe UI Semibold", 8),
+            anchor="w"
         )
         chk.pack(side="left")
 
         del_btn = tk.Label(
             top_line,
-            text="✕",
+            text="✕ Remove",
             bg="#F9F9FB",
             fg=THEME["subtext"],
             cursor="hand2",
-            font=("Segoe UI", 9)
+            font=("Segoe UI", 8)
         )
         del_btn.pack(side="right")
 
@@ -441,18 +446,18 @@ class CProSuiteApp:
         u_box.pack(fill="x", pady=(1, 3))
         tk.Label(u_box, text="Username:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
         u_border = tk.Frame(u_box, bg=THEME["border"], padx=1, pady=1)
-        u_border.pack(fill="x")
-        ent_user = tk.Entry(u_border, textvariable=user_var, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=3, font=("Segoe UI", 8))
+        u_border.pack(fill="x", pady=(1, 0))
+        ent_user = tk.Entry(u_border, textvariable=user_var, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=4, font=("Segoe UI", 9))
         ent_user.pack(fill="x")
 
         # Password row
         p_box = tk.Frame(box, bg="#F9F9FB")
         p_box.pack(fill="x", pady=(1, 2))
-        tk.Label(p_box, text="Password:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
+        tk.Label(p_box, text="Session Password:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
         p_border = tk.Frame(p_box, bg=THEME["border"], padx=1, pady=1)
-        p_border.pack(fill="x")
+        p_border.pack(fill="x", pady=(1, 0))
         show_char = "" if self.show_pwd.get() else "•"
-        ent_pwd = tk.Entry(p_border, textvariable=pwd_var, show=show_char, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=3, font=("Segoe UI", 8))
+        ent_pwd = tk.Entry(p_border, textvariable=pwd_var, show=show_char, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=4, font=("Segoe UI", 9))
         ent_pwd.pack(fill="x")
 
         acc_obj = {
@@ -469,13 +474,10 @@ class CProSuiteApp:
         del_btn.bind("<Enter>", lambda e, b=del_btn: b.config(fg=THEME["red"]))
         del_btn.bind("<Leave>", lambda e, b=del_btn: b.config(fg=THEME["subtext"]))
 
-        for w in (card, box, top_line, chk, u_box, p_box, ent_user, ent_pwd):
-            w.bind("<MouseWheel>", lambda e: self.accounts_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-
         self.accounts.append(acc_obj)
         self._refresh_account_indices()
-        self.accounts_canvas.update_idletasks()
-        self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
+        self.sidebar_canvas.update_idletasks()
+        self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
 
     def _remove_account_row(self, acc_obj):
         if len(self.accounts) <= 1:
@@ -486,8 +488,8 @@ class CProSuiteApp:
         acc_obj["card"].destroy()
         self.accounts.remove(acc_obj)
         self._refresh_account_indices()
-        self.accounts_canvas.update_idletasks()
-        self.accounts_canvas.configure(scrollregion=self.accounts_canvas.bbox("all"))
+        self.sidebar_canvas.update_idletasks()
+        self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
         self._save_accounts_config()
 
     def _refresh_account_indices(self):
