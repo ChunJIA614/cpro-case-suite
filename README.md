@@ -2,11 +2,11 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/playwright-automation-green.svg)](https://playwright.dev/)
-[![OCR Engine](https://img.shields.io/badge/OCR-RapidOCR%20%7C%20PyMuPDF-orange.svg)](https://github.com/RapidAI/RapidOCR)
+[![OCR Engine](https://img.shields.io/badge/OCR-Windows%20WinRT%20%7C%20RapidOCR%20%7C%20PyMuPDF-orange.svg)](https://github.com/RapidAI/RapidOCR)
 [![UI Framework](https://img.shields.io/badge/UI-Tkinter%20%28Apple%20HIG%29-lightgrey.svg)](https://docs.python.org/3/library/tkinter.html)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-An intelligent, high-efficiency desktop application engineered for legal practitioners and law firms handling bank legal case listings. **C-PRO Case Suite** streamlines the extraction of borrower and account information from legal documents (PDF invoices, summons, notices) and automates multi-account, multi-section status verification against the **Hong Leong Bank (HLB) C-PRO Law Firm Portal** (`https://hlbcclo.hlb.com.my/lawfirm/case-listing`).
+An intelligent, end-to-end desktop automation suite engineered for legal practitioners and law firms handling bank legal case listings. **C-PRO Case Suite** extracts per-invoice account, borrower, date, and amount details from multi-invoice PDFs (digital or scanned), verifies cases and billing records across multiple logins and sections on the **Hong Leong Bank (HLB) C-PRO Law Firm Portal** (`https://hlbcclo.hlb.com.my/lawfirm/case-listing`), and automatically splits and uploads verified single-invoice PDFs as `E-INVOICE`.
 
 ---
 
@@ -14,14 +14,16 @@ An intelligent, high-efficiency desktop application engineered for legal practit
 - [Overview & Problem Statement](#-overview--problem-statement)
 - [Key Features](#-key-features)
 - [Application Architecture](#-application-architecture)
-  - [1. Intelligent PDF Extraction Pipeline](#1-intelligent-pdf-extraction-pipeline)
-  - [2. Dynamic Multi-Account Portal Automation Cycle](#2-dynamic-multi-account-portal-automation-cycle)
+  - [1. Intelligent Multi-Invoice PDF Extraction Pipeline](#1-intelligent-multi-invoice-pdf-extraction-pipeline)
+  - [2. End-to-End Multi-Account Portal Verification & E-INVOICE Upload](#2-end-to-end-multi-account-portal-verification--e-invoice-upload)
 - [User Interface](#-user-interface)
 - [Installation & Setup](#-installation--setup)
 - [Usage Guide](#-usage-guide)
-- [Generated Excel Reports](#-generated-excel-reports)
+- [Generated Excel Reports & Extracted PDFs](#-generated-excel-reports--extracted-pdfs)
 - [Technical Deep Dive](#-technical-deep-dive)
   - [DevExtreme dxDataGrid Stabilization](#devextreme-dxdatagrid-stabilization)
+  - [Billing Verification & Subset-Sum Matching](#billing-verification--subset-sum-matching)
+  - [Eye-Preview Duplicate Inspection & Selective PDF Splitting](#eye-preview-duplicate-inspection--selective-pdf-splitting)
   - [Intelligent Session Recovery & Anti-Kickout](#intelligent-session-recovery--anti-kickout)
   - [Resilient File I/O & Locked Workbook Fallbacks](#resilient-file-io--locked-workbook-fallbacks)
 - [Security & Compliance](#-security--compliance)
@@ -32,146 +34,127 @@ An intelligent, high-efficiency desktop application engineered for legal practit
 
 ## 💡 Overview & Problem Statement
 
-Law firms acting on behalf of banking institutions frequently receive dense batches of PDF fee bills, notifications, and summons requiring cross-referencing against bank case portals. Performing this process manually presents significant challenges:
+Law firms acting on behalf of banking institutions frequently process large scanned PDF batches containing dozens of invoices mixed with printed portal billing histories. Handling this manually presents major bottlenecks:
 
-1. **Repetitive Manual Data Entry**: Staff must manually copy account numbers and borrower names across dozens or hundreds of PDF pages.
-2. **Multi-Account Switching**: Firms and legal departments operate under multiple distinct portal accounts (e.g., branch logins, partner credentials, or team accounts), requiring tedious repeated logins.
-3. **Multi-Section Tab Traversal**: For each account, legal clerks must check separate portal tabs: *Case In Progress*, *Case Withhold*, and *Case Withdrawn*.
-4. **Portal Instability & Concurrency Kickouts**: Bank portals often invalidate sessions unexpectedly or when an account is accessed concurrently, disrupting manual lookups.
-5. **Audit Trail Gaps**: Manual checks often lack time-stamped proof of verification across accounts.
+1. **Multi-Invoice Batch Scanning & Manual Splitting**: Staff must read scanned invoices, separate individual invoice pages from attached billing printouts, and save single-case PDFs manually.
+2. **Multi-Account & Multi-Section Lookup**: Cases can sit under different portal accounts (branch/firm logins) and tabs (*Case In Progress*, *Case Withhold*, *Case Withdrawn*), and one borrower may hold multiple loan accounts.
+3. **Billing Cross-Checking**: Before uploading an invoice, staff must enter *Case Details* → *Billings* to confirm that non-rejected billing row(s) match the invoice's exact **Date** and **Total Amount** (sometimes split across multiple manual + auto-billing rows on the same date).
+4. **Duplicate E-INVOICE Disambiguation**: Existing `E-INVOICE` rows often have blank remarks and generic names, requiring staff to click the **Eye (Preview)** icon to check whether the uploaded PDF is the same invoice or a different one.
+5. **Portal Instability & Concurrency Kickouts**: Bank portals invalidate sessions on concurrent access or idle timeouts, interrupting batch runs.
 
-**C-PRO Case Suite** solves these challenges by combining **computer vision (OCR)**, **regular expression pattern extractors**, and **adaptive browser automation** into a unified, high-DPI desktop application with **fully customizable, user-defined account management**.
+**C-PRO Case Suite** automates the entire workflow end-to-end using local OCR, layout-aware invoice parsing, lossless per-invoice PDF page splitting, and self-healing Playwright browser automation.
 
 ---
 
 ## 🚀 Key Features
 
 ### 👤 Dynamic User-Entered Account Management
-- **No Hardcoded Accounts**: Enter any C-PRO username and session password directly in the interface. Not locked to fixed account names.
-- **Dynamic Account List**: Add as many accounts as your organization requires via the `＋ Add Account` button.
-- **Individual Enable / Disable Controls**: Easily toggle specific accounts on or off using checkboxes before running searches.
-- **One-Click Deletion**: Remove unwanted account entries with a single click (`✕`).
-- **Safe Username Persistence**: Configured usernames and their enabled states are saved locally (`cpro_saved_accounts.json`), eliminating the need to retype usernames every session.
-- **Strict In-Memory Password Protection**: Passwords remain exclusively in runtime RAM and are **never** written to disk or configuration files.
+- **No Hardcoded Accounts**: Enter any C-PRO username and session password directly in the sidebar.
+- **Dynamic Account List**: Add, toggle on/off, or remove (`✕`) as many C-PRO accounts as needed.
+- **Safe Username Persistence**: Usernames and enabled states are saved locally in `cpro_saved_accounts.json`.
+- **Strict In-Memory Password Protection**: Passwords remain strictly in runtime RAM and are **never** written to disk.
 
-### 🔍 Intelligent Dual-Engine PDF Extractor
-- **High-Speed Native Extraction**: Quickly extracts text layers from digital PDFs using `PyMuPDF` (`fitz`).
-- **RapidOCR Fallback for Scans**: Automatically detects scanned or flattened pages (character count < 30) and applies `RapidOCR` with ONNX Runtime at 200 DPI for high-accuracy text recovery.
-- **Malaysian Banking Pattern Matching**: Accurately isolates loan account formats (e.g., `UPL-2611339-39596078602`, `MG-2611300-26791032594`).
-- **Heuristic Borrower Name Normalization**: Extracts borrower names while filtering out legal fee headers, SV-8 codes, document numbers, and trimming titles (`BIN`, `BINTI`, `A/L`, `A/P`, `@`) to generate clean portal search keys.
+### 🔍 Zero-Setup Scanned PDF & Multi-Invoice Extractor
+- **Windows Built-In OCR + Fallbacks**: Reads digital PDF text layers (`PyMuPDF` / `pypdf`) and automatically processes scanned PDFs locally via `pypdf` + `Pillow` + **Windows WinRT OCR** (`Windows.Media.Ocr`)—with `RapidOCR` fallback when installed.
+- **Automatic Page Classification & Grouping**: Skips C-PRO *Billing History* printout pages, handles rotated scans (`/Rotate`), and groups multi-page invoices cleanly.
+- **Multi-Signal Amount & Metadata Extraction**: Extracts `Invoice No`, `Invoice Date`, `Invoice Amount` (cross-checked via `RINGGIT MALAYSIA` words, `Sub Total + Service Tax`, and totals), `Account No`, `Alt Account No` (paired `&` accounts and credit card `c:` numbers), `Borrower Name`, and exact `Invoice Pages`.
 
-### 🌐 Multi-Section Automation Engine
-- **Configurable Section Traversal**: Concurrently filters through:
-  - *Case In Progress*
-  - *Case Withhold*
-  - *Case Withdrawn*
-- **Flexible Search Strategies**:
-  - `Account No → Fallback to Name` (Recommended)
-  - `Account No Only`
-  - `Borrower Name Only`
-- **Early-Exit Optimization**: Once a case is positively identified in an account/section, redundant checks across subsequent accounts for that case are immediately skipped to maximize execution speed.
+### 🌐 Automated Billing Verification & E-INVOICE Upload
+- **All-Account Checking per Borrower**: Checks every extracted account number (`Account No` + `Alt Account No`), checks **all** matching rows returned by C-PRO (across grid pagination if needed), and—under `Account No → Fallback to Name`—checks remaining `Primary Borrower Name` matches if earlier rows fail Billing verification.
+- **Billings Tab Date & Amount Verification**: Opens **Case Details** → **Billings** → **Billing History (`All`)**, excludes `Rejected` rows, and matches either a single row or any combination/sum of rows on the exact `Invoice Date`. If no match is found, treats that match as `None` and keeps checking remaining rows, sections, and accounts (`NONE (Billing Mismatch)` if none match).
+- **Case Withdrawn Upload Rule**: For **Case Withdrawn**, verifies *Billings* Date & Amount and automatically **skips** uploading `E-INVOICE` (`COMPLETE`, `Skipped upload (Case Withdrawn)`).
+- **Eye-Preview Duplicate Check & Targeted PDF Upload**: For **Case In Progress** and **Case Withhold**:
+  1. Switches back to **Legal Details** and scrolls to **Additional Documents** (across pagination).
+  2. For any existing `E-INVOICE` row, clicks the **Eye (Preview)** icon, inspects the `Preview Document` modal (PDF network/embed bytes or screenshot OCR, with Download fallback), and only skips if it matches the target `Invoice No` / `Date & Amount`.
+  3. Otherwise, extracts **only** that invoice's page(s) into `extracted_invoices/` and submits **Add New Document** (`Document Name = E-INVOICE`, `Document Type = Others`, blank `Remark`) before marking the case **`COMPLETE`**.
+- **Configurable Verification Toggle**: Toggle **Verify Billings & Upload E-INVOICE** in the sidebar to run the full end-to-end workflow or availability-only checking.
+- **Row Controls & Error Recovery**: Interactive row checkboxes (`☑` / `☐`), **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**, double-click inline row editing (Account, Name, Invoice No, Date, Amount, Source PDF, Pages), and up to 3 automatic `CHECK ERROR` recovery passes.
 
 ### 🛡️ DevExtreme dxDataGrid Stabilization & Session Recovery
-- **Active XHR & Fetch Tracking**: Monitors underlying asynchronous network calls to prevent querying tables while they are still loading.
-- **DOM Signature Verification**: Inspects DevExtreme table rows (`tr.dx-data-row`), header cells, and `.dx-datagrid-nodata` states to ensure the DOM is settled before asserting match/not-found statuses.
-- **Anti-Kickout Auto-Recovery**: Intercepts unauthenticated toast popups, expired session dialogs, or simultaneous login kicks (`"Logged in from another location"`, `"Error! Unauthenticated"`), automatically re-authenticates, navigates back to the active section, and resumes the batch queue without manual intervention.
+- **Active XHR & Fetch Tracking**: Monitors in-flight requests and DevExtreme load panels before reading tables.
+- **DOM Signature Verification**: Waits for debounced row/empty-state stability to eliminate stale reads.
+- **Anti-Kickout Auto-Recovery**: Detects session kickouts/timeouts (`"Logged in from another location"`, `"Error! Unauthenticated"`), re-authenticates, restores the active section, and continues seamlessly.
 
-### 📊 Resilient Dual-View Excel Reporting
-- **Two Comprehensive Worksheets**:
-  1. `Summary_Report`: High-level overview of every case, availability flag, and matching user account / section.
-  2. `All_Checks_Detail`: Granular audit log showing exact timestamps, user accounts utilized, sections checked, search query used, and verbatim DevExtreme grid row text.
-- **Lock-Resistant Fallback System**: If Microsoft Excel has locked an existing output workbook, the suite automatically falls back to timestamped filenames across safe directories (`Desktop`, `Documents`, `AppData`, or `Temp`), ensuring no data loss.
-
-### 🎨 Apple Human Interface Design Desktop Experience
-- Designed with Apple Human Interface Guidelines: crisp neutral palettes, rounded cards, subtle border radiuses, and dynamic status badges.
-- **Native High-DPI Scaling**: Crisp typography and controls on modern 2K/4K Windows displays using `SetProcessDpiAwareness`.
-- **Integrated Scrollable Containers**: Smooth mousewheel-scrollable account manager that scales gracefully regardless of whether you configure 1 account or 15.
+### 📊 Resilient Excel & PDF Output Management
+- **Two Comprehensive Worksheets**: `Summary_Report` and `All_Checks_Detail` in `cpro_availability_report.xlsx`, plus `extracted_cases.xlsx` queue persistence.
+- **Lock-Resistant Fallback System**: Automatically saves timestamped fallbacks in writable system folders (`Script Directory` → `Desktop` → `Documents` → `AppData` → `Temp`) if Excel locks the target workbook.
 
 ---
 
 ## 🏗️ Application Architecture
 
-### 1. Intelligent PDF Extraction Pipeline
+### 1. Intelligent Multi-Invoice PDF Extraction Pipeline
 
 ```mermaid
 flowchart TD
-    A["Input PDF Invoices / Summons"] --> B["PyMuPDF Digital Text Layer Read"]
-    B --> C{"Page Character Count < 30?"}
-    C -- Yes (Scanned Image) --> D["RapidOCR (ONNX Runtime)"]
-    C -- No (Digital Text) --> E["Extract Raw Text Buffer"]
+    A["Input PDF Batch / Scans"] --> B{"Digital Text >= 30 chars?"}
+    B -- Yes --> C["Extract Native Text (PyMuPDF / pypdf)"]
+    B -- No (Scanned Image) --> D["Orient Largest Page Image\nWindows WinRT OCR / RapidOCR"]
+    C --> E["Classify Pages"]
     D --> E
-    E --> F["Regex Account Pattern Matcher\n([A-Z]{2,5}-\\d{7,8}-\\d{10,14})"]
-    F --> G["Borrower Name Parser &\nHeuristic Noise Filter"]
-    G --> H["Deduplicate & Clean Search Keys"]
-    H --> I["Queue in Interactive Treeview &\nExport extracted_cases.xlsx"]
+    E --> F{"C-PRO Billing Printout?"}
+    F -- Yes --> G["Exclude from Invoice Pages\n(Optional Borrower Name Fallback)"]
+    F -- No (Invoice Page) --> H["Group Multi-Page Invoices by Invoice No"]
+    H --> I["Extract Invoice No, Date, Pages,\nAccounts & Layout-Aware Borrower Name"]
+    I --> J["Multi-Signal Amount Consensus\n(Ringgit Words + SubTotal/Tax + Totals)"]
+    J --> K["Queue in Interactive Table &\nSave extracted_cases.xlsx"]
 ```
 
 ---
 
-### 2. Dynamic Multi-Account Portal Automation Cycle
+### 2. End-to-End Multi-Account Portal Verification & E-INVOICE Upload
 
 ```mermaid
 flowchart TD
-    A["Start Verification Engine"] --> B["Launch Playwright Chromium (Live/Headless)"]
-    B --> C["Select Next Enabled User-Defined Account"]
-    C --> D["Submit Sign-In Credentials (Username + Password)"]
-    D --> E{"Login Rejected / Invalid Password?"}
-    E -- Yes --> F["Prompt User for Correct Password\n(Prevent Lockout)"]
-    F --> D
-    E -- No --> G["Select Section Tab (e.g. Case In Progress)"]
-    G --> H["Await Network Quiet & dxDataGrid Settlement"]
-    H --> I["For Each Case in Queue:"]
-    I --> J{"Already Found in Previous Section?"}
-    J -- Yes --> K["Skip (Early Exit Optimization)"]
-    J -- No --> L["Apply Column Filter (Account No / Name)"]
-    L --> M{"Session Kicked / Unauthorized?"}
-    M -- Yes --> N["Auto Re-login & Restore Section Tab"]
-    N --> L
-    M -- No --> O["Scan Matching Grid Rows"]
-    O --> P["Record Findings (Status, User Account, Section, Row Details)"]
-    P --> Q{"More Cases in Queue?"}
-    Q -- Yes --> I
-    Q -- No --> R{"More Sections to Check?"}
-    R -- Yes --> G
-    R -- No --> S{"More Enabled Accounts in List?"}
-    S -- Yes --> C
-    S -- No --> T["Compile Summary & Detailed Audit Log"]
-    T --> U["Write Formatted Excel Workbook\n(cpro_availability_report.xlsx)"]
+    A["Start C-PRO Automation"] --> B["Login Next Enabled Account"]
+    B --> C["Select Section Tab\n(In Progress / Withhold / Withdrawn)"]
+    C --> D["Search Account Candidate(s)\n& Fallback to Borrower Name"]
+    D --> E{"Matching Row(s) Found?"}
+    E -- No --> F["Mark Not Found for Account/Section"]
+    E -- Yes --> G{"Verify Billings & Upload Enabled?"}
+    G -- No --> H["Mark AVAILABLE"]
+    G -- Yes --> I["Open Case Details -> Billings (All)"]
+    I --> J{"Single or Sum of Non-Rejected\nRows Matches Date & Amount?"}
+    J -- No --> K["Treat as None & Check Next Row / Account"]
+    J -- Yes --> L{"Section == Case Withdrawn?"}
+    L -- Yes --> M["Skip Upload -> Mark COMPLETE"]
+    L -- No --> N["Switch to Legal Details ->\nAdditional Documents"]
+    N --> O{"Existing E-INVOICE Row?"}
+    O -- Yes --> P["Click Eye Icon -> Inspect Preview Document\nSame Invoice No / Date?" ]
+    P -- Same --> Q["Skip Duplicate Upload -> Mark COMPLETE"]
+    P -- Different --> R["Split Invoice Pages Only -> extracted_invoices/"]
+    O -- No --> R
+    R --> S["Open '+' Modal -> Upload E-INVOICE\n(Type: Others, Remark: Blank) -> Mark COMPLETE"]
 ```
 
 ---
 
 ## 🖥️ User Interface
 
-The desktop GUI is divided into clear functional zones:
-
-1. **Header Bar**: Displays application identity and a dynamic status badge (`Ready`, `Extracting PDFs...`, `Checking C-PRO...`, `Stopping...`).
+1. **Header Bar**: Displays application identity and live status badge (`Ready`, `Extracting PDFs...`, `Checking C-PRO...`, `Re-checking errors...`, `Stopped`).
 2. **Left Sidebar**:
-   - **C-PRO Accounts (Dynamic)**:
-     - Scrollable list of custom account cards.
-     - Each card contains an enable checkbox, Username entry, session Password entry (`•`), and a delete button (`✕`).
-     - **`＋ Add Account`** button to dynamically add new account cards.
-     - **`Show Passwords`** toggle to reveal/hide typed passwords.
-   - **Sections to Check**: Checkboxes for *Case In Progress*, *Case Withhold*, and *Case Withdrawn*.
-   - **Search Strategy**: Radio selector for fallback behavior.
-   - **Live Browser Toggle**: Option to view or hide Chromium during automation.
-   - **Excel Utilities**: One-click launchers for the extracted queue file, final report, and output folder.
+   - **C-PRO ACCOUNTS**: Dynamic account cards with enable checkbox, Username, masked Session Password (`•`), **`Show Passwords`**, **`＋ Add Account`**, and **`✕ Remove`**.
+   - **SECTIONS TO CHECK**: *Case In Progress*, *Case Withhold*, *Case Withdrawn*.
+   - **SEARCH STRATEGY**: *Account No → Fallback to Name*, *Account No Only*, *Borrower Name Only*.
+   - **BILLING & UPLOAD WORKFLOW**: Toggle **Verify Billings & Upload E-INVOICE**.
+   - **Show Live Chrome Browser**: Watch Playwright live or run headless.
+   - **EXCEL FILES & OUTPUTS**: Quick buttons for `extracted_cases.xlsx`, `cpro_availability_report.xlsx`, and the output folder.
 3. **Main Content Area**:
-   - **Action Bar**: Buttons to upload PDFs, add manual entries, import external Excel files, clear list, start C-PRO check, or stop automation.
-   - **Cases Queue Table**: Interactive table with color-coded row status:
-     - 🟢 **AVAILABLE**: Case found in portal.
-     - 🔴 **NOT FOUND**: Case verified absent.
-     - 🔵 **CHECKING**: Currently active query.
-     - 🟡 **CHECK ERROR**: Encountered an error during search.
-   - **Live Activity Log & Progress**: Real-time timestamped event stream with percentage progress bar.
+   - **Action Bar**: **`＋ Upload & Extract PDFs`**, **`＋ Add Manual Row`**, **`Import Excel`**, **`Clear List`**, **`▶ Start C-PRO Check`**, **`■ Stop`**.
+   - **Cases Queue Table**: Columns for `☑`, `#`, `Invoice No`, `Account No`, `Borrower Name`, `Inv Date`, `Inv Amt`, `Pages`, `Status`, `Account(s)`, `Billing Check`, `Upload Status` with color-coded statuses:
+     - 🟢 **`COMPLETE`** / **`AVAILABLE`**: Verified & completed (or available in check-only mode).
+     - 🔴 **`NOT FOUND`** / **`NONE (Billing Mismatch)`**: Absent or failed Billing verification across all checked rows/accounts.
+     - 🔵 **`CHECKING`**: Currently active query.
+     - 🟡 **`CHECK ERROR`** / **`BILLING MATCHED (No PDF)`**: Transient search failure or billing match without a linked source PDF.
+   - **Live Activity Log & Progress**: Timestamped stream and progress bar.
 
 ---
 
 ## 📦 Installation & Setup
 
 ### Prerequisites
-- **Operating System**: Windows 10/11, macOS, or Linux.
-- **Python**: Version `3.9` or higher installed.
+- **Operating System**: Windows 10/11 (recommended for zero-setup built-in Windows OCR), macOS, or Linux.
+- **Python**: Version `3.9` or higher.
 
 ### 1. Clone the Repository
 ```bash
@@ -194,9 +177,9 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+*(On Windows 10/11, `pypdf` + `pillow` + `pandas` + `openpyxl` + `playwright` are sufficient for scanned PDF OCR and splitting; `pymupdf` and `rapidocr-onnxruntime` are optional fallbacks or needed on macOS/Linux.)*
 
 ### 4. Install Playwright Browser Binaries
-Playwright requires the Chromium browser binary to control the web session:
 ```bash
 playwright install chromium
 ```
@@ -206,95 +189,59 @@ playwright install chromium
 ## 🚦 Usage Guide
 
 ### Starting the Application
-
-- **Via Command Line**:
-  ```bash
-  python cpro_suite_app.py
-  ```
-  *(or `py cpro_suite_app.py` on Windows)*
-
-- **Via Windows Launcher**:
-  Double-click `run.bat` in the repository root folder.
+- **Via Command Line**: `python cpro_suite_app.py` *(or `py cpro_suite_app.py` on Windows)*
+- **Via Windows Launcher**: Double-click `run.bat`.
 
 ### Step-by-Step Workflow
-
 1. **Populate Cases Queue**:
-   - Click **`＋ Upload & Extract PDFs`** to select one or multiple PDF fee invoices/summons.
-   - *Alternative*: Click **`Import Excel`** to ingest an existing spreadsheet with `Account No` and `Search Name` columns.
-   - *Alternative*: Click **`＋ Add Manual Row`** to type an individual account directly.
-2. **Review & Adjust**:
-   - Double-click any row in the queue table to manually correct an account number or borrower name before executing searches.
-3. **Enter Your Accounts & Passwords**:
-   - In the **C-PRO ACCOUNTS** sidebar section, enter your C-PRO username(s) and password(s).
-   - Click **`＋ Add Account`** to add additional accounts, or click **`✕`** to remove accounts.
-   - Uncheck any account you wish to skip for the current run.
-   - Select your target sections (e.g., *Case In Progress*).
-   - Select your desired search strategy (default: *Account No → Fallback to Name*).
+   - Click **`＋ Upload & Extract PDFs`** and select one or more multi-invoice PDFs.
+   - *Alternative*: Click **`Import Excel`** (supports `Account No`, `Borrower Name`/`Search Name`, plus optional `Invoice No`, `Invoice Date`, `Invoice Amount`, `Source PDF Path`, `Invoice Pages`) or **`＋ Add Manual Row`**.
+2. **Review & Select Rows**:
+   - Double-click any row to inspect or edit `Account No`, `Search Name`, `Invoice No`, `Invoice Date`, `Invoice Amount`, `Source PDF Path`, or `Invoice Pages`.
+   - Use checkboxes or **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**.
+3. **Configure Accounts & Workflow**:
+   - Enter C-PRO usernames/passwords, select target sections, choose search strategy, and keep **`Verify Billings & Upload E-INVOICE`** enabled for full automation.
 4. **Run Automation**:
-   - Click **`▶ Start C-PRO Check`**.
-   - If any enabled account is missing a password, a prompt will appear asking for it.
-   - Monitor live progress in the activity log and queue table.
-5. **View Results**:
-   - Once completed, the output folder will open automatically.
-   - Review `cpro_availability_report.xlsx` or click the sidebar shortcuts.
+   - Click **`▶ Start C-PRO Check`** and monitor live logs.
+5. **Inspect Outputs**:
+   - Review `cpro_availability_report.xlsx` and uploaded split PDFs in `extracted_invoices/`.
 
 ---
 
-## 📈 Generated Excel Reports
+## 📈 Generated Excel Reports & Extracted PDFs
 
-The output report (`cpro_availability_report.xlsx`) is structured into two purpose-built sheets:
-
-### Sheet 1: `Summary_Report`
-Provides an executive overview of all checked cases:
-| Column Header | Description |
-| :--- | :--- |
-| `Source File` | Originating PDF or Excel file name |
-| `Account No` | Extracted bank loan account number |
-| `Search Name` | Cleaned primary borrower search string |
-| `Full Borrower Name` | Complete extracted borrower name |
-| `Availability Status` | `AVAILABLE`, `NOT FOUND`, or `CHECK ERROR` |
-| `Found In Account(s)` | Which user account(s) held the case (e.g., `USER_A, USER_B`) |
-| `Found In Section(s)` | Specific portal section tabs (e.g., `USER_A: Case In Progress`) |
-| `C-PRO Row Details` | Key details extracted from matching DevExtreme grid row |
-
-### Sheet 2: `All_Checks_Detail`
-Maintains an exhaustive, timestamped audit log of every query attempted:
-- Records individual search terms, exact user accounts utilized, target sections, matching method (`Account No` vs `Borrower Name`), and verbatim grid row contents.
+- **Split Single-Invoice PDFs**: Saved in `extracted_invoices/<InvoiceNo>_<AccountNo>_p<Pages>.pdf` inside the output directory only for cases that pass Billing verification (and require upload).
+- **Queue Workbook (`extracted_cases.xlsx`)**: Persists extracted invoice metadata, source PDF paths, and page ranges across restarts.
+- **Final Report (`cpro_availability_report.xlsx`)**:
+  - **`Summary_Report`**: `Source File`, `Source PDF Path`, `Invoice Pages`, `Invoice No`, `Invoice Date`, `Invoice Amount`, `Account No`, `Alt Account No`, `Search Name`, `Full Borrower Name`, `Availability Status`, `Found In Account(s)`, `Found In Section(s)`, `Billing Check`, `Upload Status`, `Extracted Invoice PDF`, `C-PRO Row Details`.
+  - **`All_Checks_Detail`**: `Invoice No`, `Account No`, `Search Name`, `C-PRO Account`, `Login Used`, `Section`, `Status`, `Matched By`, `Billing Check`, `Upload Status`, `C-PRO Row Details`, `Round`.
 
 ---
 
 ## 🔬 Technical Deep Dive
 
 ### DevExtreme dxDataGrid Stabilization
-The HLB C-PRO portal utilizes DevExtreme DataGrids (`.dx-datagrid`) that rely on client-side XHR/fetch queries. Naive scrapers often read empty or stale table states during async transitions.
+The HLB C-PRO portal relies on DevExtreme DataGrids (`.dx-datagrid`) with asynchronous XHR/fetch transitions. `_trigger_grid_action_and_wait()` and `_wait_for_section_table()` track active requests, `.dx-loadpanel` visibility, and debounced DOM row/empty-state snapshots before reading grid data.
 
-C-PRO Case Suite implements a multi-stage synchronization loop:
-- **XHR Monitoring**: Hooks into Playwright page events (`page.on('request')`, `page.on('requestfinished')`) to ensure no asynchronous calls are in flight.
-- **Snapshot Hashing**: Computes a continuous hash of visible row contents (`.dx-data-row`), header cells, and empty-state banners (`.dx-datagrid-nodata`).
-- **Debounced Settlement**: Requires the grid signature to remain strictly stable for at least 1.25s before evaluating data rows.
+### Billing Verification & Subset-Sum Matching
+In `find_billing_match()`, all `Billing History` pages are scanned under the `All` sub-tab, excluding `Rejected` entries. Monetary values are converted via `Decimal` into exact integer cents to evaluate both single-row matches and subset sums on the target billing date.
+
+### Eye-Preview Duplicate Inspection & Selective PDF Splitting
+Before uploading to *Additional Documents*, `_read_additional_docs_rows_and_check_einvoice()` checks paginated rows and clicks the **Eye** icon on any existing `E-INVOICE` row. It inspects the `Preview Document` modal across 4 layers (captured PDF response, `iframe`/`embed`/`object` source fetch, modal screenshot OCR, and Download icon fallback) and compares `Invoice No` / `Date & Amount` before calling `extract_invoice_pdf_pages()` via `pypdf.PdfWriter`.
 
 ### Intelligent Session Recovery & Anti-Kickout
-Bank portals frequently terminate active sessions due to idle timeouts or simultaneous logins. The suite features self-healing automation:
-1. `_is_kicked_or_unauthorized(page)` constantly monitors page URLs, toast error banners (`.toast-close-button`), and authentication modals.
-2. When a kickout occurs, the engine intercepts the condition, executes `_login_and_restore_section(page, acc, section)`, re-authenticates the account, navigates back to the current section tab, and retries the failed search without aborting the queue.
-3. If bad credentials are submitted, an interactive dialog (`simpledialog.askstring`) prompts the operator for a corrected password rather than repeatedly failing and causing a bank account lockout.
+`_is_kicked_or_unauthorized()` monitors URLs, sign-in forms, and toast banners; `_login_and_restore_section()` automatically re-authenticates and restores the active section tab, while `_prompt_for_correct_password()` prevents bank account lockouts on wrong passwords.
 
 ### Resilient File I/O & Locked Workbook Fallbacks
-If an operator has `cpro_availability_report.xlsx` open in Microsoft Excel, standard Python file writers raise `PermissionError`. 
-
-The suite wraps all save routines with `_write_with_fallback()`:
-- Automatically detects file locks.
-- Discovers writable system paths (`Script Directory` → `Desktop/Output` → `Documents/Output` → `AppData` → `Temp`).
-- Saves files under timestamped variants (e.g., `cpro_availability_report_20261101_190500.xlsx`) and informs the user via the live activity log.
+`_write_with_fallback()` intercepts `PermissionError` when an Excel report is open in Microsoft Excel and saves a timestamped copy to the first writable output path.
 
 ---
 
 ## 🔒 Security & Compliance
 
-- **No Remote Credential Transmission**: Passwords and case details are processed exclusively between your local machine and the official Hong Leong Bank portal.
-- **In-Memory Credential Lifespan**: All passwords entered into the GUI reside strictly in memory and are discarded when the application window is closed. No passwords are ever saved to disk.
-- **Non-Sensitive Config Storage**: Only account usernames and their enabled states are saved to `cpro_saved_accounts.json` for user convenience.
-- **Local OCR & Processing**: Text extraction and OCR are executed locally on CPU/ONNX Runtime without uploading legal documents to third-party cloud APIs.
+- **No Remote Credential Transmission**: Credentials and case data communicate solely between your local machine and the official Hong Leong Bank portal.
+- **In-Memory Credential Lifespan**: Passwords reside exclusively in memory and are discarded on exit.
+- **Local OCR & Processing**: Windows WinRT OCR / RapidOCR and PDF page splitting execute 100% locally without uploading legal invoices to external cloud APIs.
 
 ---
 
@@ -302,12 +249,12 @@ The suite wraps all save routines with `_write_with_fallback()`:
 
 | Issue | Cause | Solution |
 | :--- | :--- | :--- |
-| **Playwright Missing Error** | Browser binaries not installed | Run `playwright install chromium` in your activated Python environment. |
-| **Grid Load Timeout Error** | Slow portal network response | Verify your internet connection. Check if HLB C-PRO portal is under maintenance. |
-| **Missing Username Warning** | An account card is enabled without a username | Enter a username for the account, or uncheck / remove it (`✕`). |
-| **Login Rejected / Invalid Password** | Incorrect password for account | The app will prompt you to enter the correct password. Ensure you are using the active C-PRO credentials. |
-| **Output File Locked** | Excel file is open in Microsoft Excel | Close the file in Excel, or find the fallback report in the opened output folder. |
-| **PDF Extraction Misses Name** | Unusual formatting in PDF | Double-click the row in the Cases Queue to manually edit the search name before starting the check. |
+| **Playwright Missing Error** | Browser binaries not installed | Run `playwright install chromium` in your Python environment. |
+| **Grid Load Timeout Error** | Slow portal network response | Check your internet connection or verify HLB C-PRO portal availability. |
+| **Missing Username Warning** | An account card is enabled without a username | Enter a username or uncheck / remove (`✕`) the card. |
+| **Login Rejected / Invalid Password** | Incorrect password for account | Enter the valid password when prompted. |
+| **Output File Locked** | Workbook is open in Excel | Close Excel or check the timestamped fallback path shown in the log. |
+| **Missing Amount / Name on Scan** | Clipped scan or missing multi-page scan page | Double-click the row in the Cases Queue to fill/correct the field before running. |
 
 ---
 

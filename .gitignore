@@ -14,6 +14,7 @@ venv.bak/
 # Output directories & generated files
 Output/
 *Output*/
+extracted_invoices/
 extracted_cases.xlsx
 cpro_availability_report.xlsx
 *.xlsx
