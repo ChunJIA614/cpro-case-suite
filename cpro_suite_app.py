@@ -2257,9 +2257,86 @@ class CProSuiteApp:
     # --------------------------------------------------------------------------
     # PLAYWRIGHT PORTAL HELPERS
     # --------------------------------------------------------------------------
-    @staticmethod
-    def _is_kicked_or_unauthorized(page):
+    def _dismiss_session_timeout_warning(self, page, from_handler=False):
+        """If C-PRO shows the 'Session Timeout Warning' popup, click 'Stay' to prevent kickout."""
+        if getattr(self, "_handling_timeout_popup", False):
+            return False
         try:
+            self._handling_timeout_popup = True
+            if not from_handler:
+                # Use page.evaluate during polling so Locator checks/clicks never deadlock with add_locator_handler
+                clicked = page.evaluate(r"""() => {
+                    const containers = Array.from(document.querySelectorAll(".swal2-popup, .modal, [role='dialog'], .dx-popup-wrapper, div"));
+                    for (const el of containers) {
+                        const style = window.getComputedStyle(el);
+                        if (!style || style.display === "none" || style.visibility === "hidden" || el.offsetParent === null) {
+                            if (style.position !== "fixed") continue;
+                        }
+                        if (el.offsetWidth === 0 && el.offsetHeight === 0) continue;
+                        const txt = (el.innerText || "").trim();
+                        if (!/Session\s*Timeout\s*Warning|Your\s+session\s+will\s+expire/i.test(txt)) continue;
+                        const btns = Array.from(el.querySelectorAll("button, a, [role='button']"));
+                        const stayBtn = btns.find(b => /^\s*Stay\s*$/i.test((b.innerText || "").trim()) && b.offsetWidth > 0 && b.offsetHeight > 0);
+                        if (stayBtn) {
+                            stayBtn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    self.log("[SESSION] Detected 'Session Timeout Warning' popup — clicked 'Stay' to keep session active.")
+                    page.wait_for_timeout(300)
+                    self._wait_for_network_quiet(page, timeout=2000)
+                return bool(clicked)
+
+            warn_txt = re.compile(r"Session\s*Timeout\s*Warning|Your\s+session\s+will\s+expire", re.I)
+            popup = page.locator(
+                ".swal2-popup:visible, .modal:visible, [role='dialog']:visible, .dx-popup-wrapper:visible"
+            ).filter(has_text=warn_txt).first
+            has_popup = popup.count() > 0 and popup.is_visible()
+            if not has_popup:
+                txt_loc = page.locator("text=/Session\\s*Timeout\\s*Warning|Your\\s+session\\s+will\\s+expire/i").first
+                if txt_loc.count() == 0 or not txt_loc.is_visible():
+                    return False
+                stay_btn = page.locator(
+                    "button:has-text('Stay'):visible, a:has-text('Stay'):visible, [role='button']:has-text('Stay'):visible"
+                ).first
+            else:
+                stay_btn = popup.locator(
+                    "button:has-text('Stay'), a:has-text('Stay'), [role='button']:has-text('Stay'), button.swal2-confirm:has-text('Stay')"
+                ).first
+
+            if stay_btn.count() > 0 and stay_btn.is_visible():
+                self.log("[SESSION] Detected 'Session Timeout Warning' popup — clicking 'Stay' to keep session active...")
+                stay_btn.click(timeout=3000)
+                try:
+                    if has_popup:
+                        popup.wait_for(state="hidden", timeout=4000)
+                    else:
+                        page.wait_for_timeout(400)
+                except Exception:
+                    pass
+                self._wait_for_network_quiet(page, timeout=2000)
+                return True
+        except Exception:
+            return False
+        finally:
+            self._handling_timeout_popup = False
+        return False
+
+    def _install_session_timeout_handler(self, page):
+        """Register Playwright locator handler so any action blocked by Session Timeout Warning auto-clicks 'Stay'."""
+        if not hasattr(page, "add_locator_handler"):
+            return
+        warn_loc = page.locator(
+            ".swal2-popup, .modal, [role='dialog'], .dx-popup-wrapper"
+        ).filter(has_text=re.compile(r"Session\s*Timeout\s*Warning|Your\s+session\s+will\s+expire", re.I)).first
+        page.add_locator_handler(warn_loc, lambda: self._dismiss_session_timeout_warning(page, from_handler=True))
+
+    def _is_kicked_or_unauthorized(self, page):
+        try:
+            self._dismiss_session_timeout_warning(page)
             if "login" in page.url.lower() or "auth" in page.url.lower():
                 return True
             if page.locator("button:has-text('Sign In')").is_visible():
@@ -3210,6 +3287,7 @@ class CProSuiteApp:
         page.on("response", _on_response)
         preview_info = {}
         try:
+            self._dismiss_session_timeout_warning(page)
             # Locate and click the Eye button inside the target row
             clicked_eye = page.evaluate(r"""(trIdx) => {
                 const headingNodes = Array.from(document.querySelectorAll("*"))
@@ -3441,6 +3519,7 @@ class CProSuiteApp:
             }""")
 
         for _ in range(15):
+            self._dismiss_session_timeout_warning(page)
             info = _inspect_visible_rows()
             if not info.get("foundContainer"):
                 break
@@ -3489,6 +3568,7 @@ class CProSuiteApp:
         heading.wait_for(state="visible", timeout=10000)
         heading.scroll_into_view_if_needed(timeout=4000)
         page.wait_for_timeout(250)
+        self._dismiss_session_timeout_warning(page)
 
         # Expand section if its table/empty message isn't visible yet
         container_visible_table = page.evaluate(r"""() => {
@@ -3919,6 +3999,7 @@ class CProSuiteApp:
 
             context = browser.new_context()
             page = context.new_page()
+            self._install_session_timeout_handler(page)
             current_sec_idx = 0
             current_section = active_sections[0] if active_sections else "(not selected)"
 

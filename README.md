@@ -73,6 +73,7 @@ Law firms acting on behalf of banking institutions frequently process large scan
 ### 🛡️ DevExtreme dxDataGrid Stabilization & Session Recovery
 - **Active XHR & Fetch Tracking**: Monitors in-flight requests and DevExtreme load panels before reading tables.
 - **DOM Signature Verification**: Waits for debounced row/empty-state stability to eliminate stale reads.
+- **Auto-Dismiss Session Timeout Warning**: Automatically detects C-PRO's `Session Timeout Warning` popup (`"Your session will expire in ... seconds"`) via Playwright's locator handler and polling checks, clicking **`Stay`** immediately to prevent forced logout and click interception.
 - **Anti-Kickout Auto-Recovery**: Detects session kickouts/timeouts (`"Logged in from another location"`, `"Error! Unauthenticated"`), re-authenticates, restores the active section, and continues seamlessly.
 
 ### 📊 Resilient Excel & PDF Output Management
@@ -230,7 +231,7 @@ In `find_billing_match()`, all `Billing History` pages are scanned under the `Al
 Before uploading to *Additional Documents*, `_read_additional_docs_rows_and_check_einvoice()` checks paginated rows and clicks the **Eye** icon on any existing `E-INVOICE` row. It inspects the `Preview Document` modal across 4 layers (captured PDF response, `iframe`/`embed`/`object` source fetch, modal screenshot OCR, and Download icon fallback) and compares `Invoice No` / `Date & Amount` before calling `extract_invoice_pdf_pages()` via `pypdf.PdfWriter`.
 
 ### Intelligent Session Recovery & Anti-Kickout
-`_is_kicked_or_unauthorized()` monitors URLs, sign-in forms, and toast banners; `_login_and_restore_section()` automatically re-authenticates and restores the active section tab, while `_prompt_for_correct_password()` prevents bank account lockouts on wrong passwords.
+`_install_session_timeout_handler()` and `_dismiss_session_timeout_warning()` automatically detect C-PRO's `Session Timeout Warning` modal (`"Your session will expire in ... seconds"`) and click **`Stay`** so long runs are never interrupted or kicked out. In addition, `_is_kicked_or_unauthorized()` monitors URLs, sign-in forms, and toast banners; `_login_and_restore_section()` automatically re-authenticates and restores the active section tab, while `_prompt_for_correct_password()` prevents bank account lockouts on wrong passwords.
 
 ### Resilient File I/O & Locked Workbook Fallbacks
 `_write_with_fallback()` intercepts `PermissionError` when an Excel report is open in Microsoft Excel and saves a timestamped copy to the first writable output path.
