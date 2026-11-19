@@ -2359,8 +2359,13 @@ class CProSuiteApp:
             pass
 
     @staticmethod
+    def _is_fatal_auth_error(exc):
+        msg = str(exc or "").lower()
+        return "rejected" in msg or "cancelled" in msg
+
+    @staticmethod
     def _section_tab_candidates(page, section):
-        exact = re.compile(rf"^\s*{re.escape(section)}(?:\s+\d+)?\s*$", re.IGNORECASE)
+        exact = re.compile(rf"^\s*{re.escape(section)}(?:\s*\(?\s*[\d,]+\+?\s*\)?)?\s*$", re.IGNORECASE)
         selectors = ("[role='tab']", ".nav-tabs a", ".nav-tabs button", ".nav-link", ".dx-tab", "button", "a", "li")
         seen = set()
         for selector in selectors:
@@ -2396,7 +2401,7 @@ class CProSuiteApp:
         except Exception:
             return
 
-    def _wait_for_section_table(self, page, section, timeout_ms=30000, action=None):
+    def _wait_for_section_table(self, page, section, timeout_ms=45000, action=None):
         started = time.monotonic()
         deadline = started + timeout_ms / 1000.0
         last_signature = None
@@ -2471,12 +2476,23 @@ class CProSuiteApp:
                     pass
 
     def _switch_section_and_wait(self, page, section):
+        self._dismiss_session_timeout_warning(page)
         tab = next(self._section_tab_candidates(page, section), None)
         if tab is None:
+            if self._is_kicked_or_unauthorized(page):
+                raise InvalidCredentialsError(f"Session not authenticated before switching to '{section}'.")
             raise GridLoadTimeoutError(f"Could not find a visible '{section}' tab.")
         self.log(f"[WAIT] Clicking section tab '{section}'...")
         self._last_searched_column = None
-        self._wait_for_section_table(page, section, action=lambda: tab.click(timeout=8000))
+
+        def _click_tab():
+            try:
+                tab.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            tab.click(timeout=8000)
+
+        self._wait_for_section_table(page, section, timeout_ms=45000, action=_click_tab)
 
     def _prompt_for_correct_password(self, acc, reason):
         result = {"password": None}
@@ -2534,8 +2550,16 @@ class CProSuiteApp:
             pass
 
         for login_attempt in range(2):
-            page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=20000)
-            self._wait_for_network_quiet(page, timeout=3500)
+            for nav_try in range(2):
+                try:
+                    page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=45000)
+                    break
+                except PlaywrightTimeoutError:
+                    if nav_try == 1:
+                        raise
+                    self.log(f"[AUTH] Navigation timed out for {username}; retrying once...")
+                    page.wait_for_timeout(1000)
+            self._wait_for_network_quiet(page, timeout=4000)
             page.wait_for_timeout(300)
 
             sign_in = page.locator("button:has-text('Sign In')")
@@ -3119,13 +3143,16 @@ class CProSuiteApp:
         raise RuntimeError("Could not enter Case Details page from the matched Case Listing row.")
 
     def _switch_case_tab(self, page, tab_name):
+        self._dismiss_session_timeout_warning(page)
         tab = next(self._section_tab_candidates(page, tab_name), None)
         if tab is None:
+            if self._is_kicked_or_unauthorized(page):
+                raise InvalidCredentialsError(f"Session expired before switching to '{tab_name}' tab.")
             raise RuntimeError(f"Could not find '{tab_name}' tab on Case Details page.")
         tab.scroll_into_view_if_needed(timeout=2000)
         tab.click(timeout=5000)
         self._wait_for_network_quiet(page, timeout=4000)
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(450)
         if self._is_kicked_or_unauthorized(page):
             raise InvalidCredentialsError(f"Session expired switching to '{tab_name}' tab.")
 
@@ -3134,15 +3161,21 @@ class CProSuiteApp:
         last_sig = None
         stable = 0
         while time.monotonic() < deadline:
+            if self.stop_requested:
+                raise GridLoadTimeoutError("Stopped while waiting for table.")
             if self._is_kicked_or_unauthorized(page):
                 raise InvalidCredentialsError("Session expired while waiting for table.")
             sig, loading = self._grid_snapshot(page)
-            if sig == last_sig and not loading:
+            try:
+                grid_visible = page.locator(".dx-datagrid:visible .dx-datagrid-headers:visible").count() > 0
+            except Exception:
+                grid_visible = False
+            if grid_visible and sig == last_sig and not loading:
                 stable += 1
             else:
                 last_sig = sig
                 stable = 0
-            if stable >= 3 and not loading:
+            if grid_visible and stable >= 3 and not loading:
                 return
             page.wait_for_timeout(200)
 
@@ -3232,6 +3265,18 @@ class CProSuiteApp:
 
         return collected
 
+    def _billing_grid_is_visible(self, page):
+        try:
+            grids = page.locator(".dx-datagrid:visible")
+            for g_idx in range(grids.count()):
+                g = grids.nth(g_idx)
+                hdr_text = re.sub(r"[^a-z0-9]+", "", g.locator(".dx-datagrid-headers:visible").inner_text(timeout=500).casefold())
+                if "billingdate" in hdr_text or "totalamt" in hdr_text:
+                    return True
+        except Exception:
+            pass
+        return False
+
     def _verify_case_billings(self, page, case):
         """Switch to Billings tab and verify invoice date & amount."""
         target_date = parse_date_flexible(case.get("Invoice Date"))
@@ -3239,8 +3284,35 @@ class CProSuiteApp:
         if target_date is None or target_cents is None:
             return False, "Missing Invoice Date or Invoice Amount"
 
-        self._switch_case_tab(page, "Billings")
-        page.locator("text=/Billing History/i").first.wait_for(state="visible", timeout=10000)
+        billings_ready = False
+        for tab_try in range(2):
+            self._switch_case_tab(page, "Billings")
+            deadline = time.monotonic() + (6.0 if tab_try == 0 else 10.0)
+            while time.monotonic() < deadline:
+                if self.stop_requested:
+                    raise GridLoadTimeoutError("Stopped while waiting for Billing History.")
+                if self._is_kicked_or_unauthorized(page):
+                    raise InvalidCredentialsError("Session expired while loading Billing History.")
+                if self._billing_grid_is_visible(page):
+                    billings_ready = True
+                    break
+                try:
+                    vis_heading = page.locator("h1:visible, h2:visible, h3:visible, h4:visible, h5:visible, span:visible, div:visible").filter(
+                        has_text=re.compile(r"^\s*Billing\s+History\s*$", re.I)
+                    )
+                    if vis_heading.count() > 0 and page.locator(".dx-datagrid:visible").count() > 0:
+                        billings_ready = True
+                        break
+                except Exception:
+                    pass
+                page.wait_for_timeout(250)
+            if billings_ready:
+                break
+            self.log("  [!] Billings tab did not display Billing History yet; retrying tab click...")
+
+        if not billings_ready:
+            raise RuntimeError("Billing History grid did not become visible on the Billings tab.")
+
         billing_rows = self._read_billing_history_rows(page)
         return find_billing_match(billing_rows, target_date, target_cents)
 
@@ -3762,13 +3834,23 @@ class CProSuiteApp:
             return
 
         if not returned:
-            page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=20000)
+            page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=45000)
             self._wait_for_network_quiet(page, timeout=4000)
             if self._is_kicked_or_unauthorized(page):
                 self._login_and_restore_section(page, acc, section=section)
                 return
 
-        self._switch_section_and_wait(page, section)
+        try:
+            self._switch_section_and_wait(page, section)
+        except InvalidCredentialsError as e:
+            if self._is_fatal_auth_error(e):
+                raise
+            self._login_and_restore_section(page, acc, section=section)
+        except Exception:
+            if self._is_kicked_or_unauthorized(page):
+                self._login_and_restore_section(page, acc, section=section)
+            else:
+                raise
 
     def _process_matched_rows_for_case(self, page, acc, section, search_col, search_val, matched_rows, case, skip_summaries=None):
         """
@@ -3819,7 +3901,6 @@ class CProSuiteApp:
             if grid_page > 1:
                 self._go_to_grid_page(page, grid_page)
 
-            skip_summaries.add(row_summary)
             checked_any_row = True
             need_reapply_filter = True
             self.log(f"  [OPEN] Entering case row #{row_idx + 1} (page {grid_page}) to verify Billings...")
@@ -3827,12 +3908,14 @@ class CProSuiteApp:
                 self._open_case_from_grid_row(page, row_idx)
                 billing_ok, billing_detail = self._verify_case_billings(page, case)
                 if not billing_ok:
+                    skip_summaries.add(row_summary)
                     self.log(f"  [BILLING MISMATCH] {billing_detail} -> checking next account / treating as None.")
                     last_mismatch_detail = billing_detail
                     continue
 
                 self.log(f"  [BILLING OK] {billing_detail}")
                 if section.strip().casefold() == "case withdrawn":
+                    skip_summaries.add(row_summary)
                     msg = "Skipped upload (Case Withdrawn)"
                     self.log(f"  [COMPLETE] {msg}")
                     return {
@@ -3843,6 +3926,7 @@ class CProSuiteApp:
                         "matched_row_detail": row_summary,
                     }
                 upload_outcome, upload_msg, pdf_out = self._upload_invoice_in_legal_details(page, case)
+                skip_summaries.add(row_summary)
                 if upload_outcome in ("UPLOADED", "SKIPPED_EXISTS"):
                     self.log(f"  [COMPLETE] {upload_msg}")
                     return {
@@ -3863,7 +3947,14 @@ class CProSuiteApp:
                     }
             finally:
                 if not self.stop_requested:
-                    self._return_to_case_listing_and_restore_section(page, acc, section)
+                    try:
+                        self._return_to_case_listing_and_restore_section(page, acc, section)
+                    except InvalidCredentialsError as ret_err:
+                        if self._is_fatal_auth_error(ret_err):
+                            raise
+                        self.log(f"  [!] Session interrupted while returning to {section}; will recover on next step.")
+                    except Exception as ret_err:
+                        self.log(f"  [!] Notice returning to {section}: {ret_err}")
 
         if not checked_any_row:
             return {
@@ -4018,28 +4109,53 @@ class CProSuiteApp:
                     current_section = section
                     self.log(f"[{username}] Switching to section: {section}")
 
-                    try:
-                        if self._is_kicked_or_unauthorized(page):
-                            self._login_and_restore_section(page, acc, section=None)
-                        self._switch_section_and_wait(page, section)
-                    except InvalidCredentialsError:
-                        raise
-                    except Exception as section_error:
+                    section_loaded = False
+                    last_section_err = None
+                    for sec_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
                         if self.stop_requested:
                             break
-                        self.log(f"[!] Section '{section}' failed to load ({section_error}). Re-authenticating & retrying section...")
                         try:
-                            self._login_and_restore_section(page, acc, section=section)
-                        except InvalidCredentialsError:
-                            raise
-                        except Exception as retry_err:
-                            err_msg = f"Could not load the {section} section table: {retry_err}"
-                            self.log(f"[ERROR] [{username}] {err_msg}")
-                            _mark_sections_error(acc_idx, username, [section], err_msg)
-                            completed_steps = (acc_idx * len(active_sections) + sec_idx + 1) * len(pass_indices)
-                            self.set_progress(completed_steps, total_steps)
-                            self.refresh_table()
-                            continue
+                            needs_restore = (
+                                sec_attempt > 1
+                                or self._is_kicked_or_unauthorized(page)
+                                or self._is_on_case_details(page)
+                                or "/case-listing" not in page.url.lower()
+                            )
+                            if needs_restore:
+                                self._login_and_restore_section(page, acc, section=section)
+                            else:
+                                self._switch_section_and_wait(page, section)
+                            section_loaded = True
+                            break
+                        except InvalidCredentialsError as sec_auth_err:
+                            if self._is_fatal_auth_error(sec_auth_err):
+                                raise
+                            last_section_err = sec_auth_err
+                            self.log(
+                                f"[!] Session expired/kicked switching to '{section}' "
+                                f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}): {sec_auth_err}. Re-logging..."
+                            )
+                            page.wait_for_timeout(800)
+                        except Exception as section_error:
+                            if self.stop_requested:
+                                break
+                            last_section_err = section_error
+                            self.log(
+                                f"[!] Section '{section}' failed to load "
+                                f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}: {section_error}). Re-authenticating & retrying..."
+                            )
+                            page.wait_for_timeout(800)
+
+                    if self.stop_requested:
+                        break
+                    if not section_loaded:
+                        err_msg = f"Could not load the {section} section table after {MAX_RETRIES_ON_KICKOUT} attempt(s): {last_section_err}"
+                        self.log(f"[ERROR] [{username}] {err_msg}")
+                        _mark_sections_error(acc_idx, username, [section], err_msg)
+                        completed_steps = (acc_idx * len(active_sections) + sec_idx + 1) * len(pass_indices)
+                        self.set_progress(completed_steps, total_steps)
+                        self.refresh_table()
+                        continue
 
                     for idx in pass_indices:
                         if self.stop_requested:
@@ -4077,8 +4193,36 @@ class CProSuiteApp:
                                 break
                             try:
                                 matched_rows = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
-                            except InvalidCredentialsError:
-                                raise
+                            except InvalidCredentialsError as auth_err:
+                                if self._is_fatal_auth_error(auth_err):
+                                    raise
+                                if self.stop_requested:
+                                    break
+                                self.log(f"  [ERROR] Session error searching '{s_val}' after retries: {auth_err}. Marking this row only & recovering section...")
+                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(auth_err))
+                                detailed_log.append({
+                                    "Invoice No": case.get("Invoice No", ""),
+                                    "Account No": acc_no,
+                                    "Search Name": search_name,
+                                    "C-PRO Account": username,
+                                    "Login Used": username,
+                                    "Section": section,
+                                    "Status": "CHECK ERROR",
+                                    "Matched By": s_label,
+                                    "Billing Check": "-",
+                                    "Upload Status": "-",
+                                    "C-PRO Row Details": str(auth_err),
+                                    "Round": round_label,
+                                })
+                                try:
+                                    self._login_and_restore_section(page, acc, section=section)
+                                except InvalidCredentialsError as rec_err:
+                                    if self._is_fatal_auth_error(rec_err):
+                                        raise
+                                except Exception:
+                                    pass
+                                pair_had_error = True
+                                break
                             except Exception as e:
                                 if self.stop_requested:
                                     break
@@ -4140,17 +4284,89 @@ class CProSuiteApp:
                                 case_resolved_in_pair = True
                                 break
 
-                            try:
-                                wf = self._process_matched_rows_for_case(
-                                    page, acc, section, s_col, s_val, matched_rows, case, skip_summaries=checked_row_summaries
-                                )
-                            except InvalidCredentialsError:
-                                raise
-                            except Exception as wf_err:
+                            wf = None
+                            wf_last_err = None
+                            current_matches = matched_rows
+                            for wf_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
                                 if self.stop_requested:
                                     break
-                                self.log(f"  [ERROR] Workflow failed inside Case Details for '{acc_no}': {wf_err}")
-                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(wf_err))
+                                try:
+                                    wf = self._process_matched_rows_for_case(
+                                        page, acc, section, s_col, s_val, current_matches, case, skip_summaries=checked_row_summaries
+                                    )
+                                    wf_last_err = None
+                                    break
+                                except InvalidCredentialsError as wf_auth_err:
+                                    if self._is_fatal_auth_error(wf_auth_err):
+                                        raise
+                                    wf_last_err = wf_auth_err
+                                    if wf_attempt < MAX_RETRIES_ON_KICKOUT and not self.stop_requested:
+                                        self.log(
+                                            f"  [!] Session expired inside Case Details for '{acc_no}' "
+                                            f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_auth_err}). Re-logging & retrying..."
+                                        )
+                                        try:
+                                            self._login_and_restore_section(page, acc, section=section)
+                                            current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
+                                            if not current_matches:
+                                                wf = {
+                                                    "outcome": "ALL_SKIPPED",
+                                                    "billing_detail": "",
+                                                    "upload_status": "",
+                                                    "extracted_pdf": "-",
+                                                    "matched_row_detail": "-",
+                                                }
+                                                wf_last_err = None
+                                                break
+                                        except InvalidCredentialsError as rec_err:
+                                            if self._is_fatal_auth_error(rec_err):
+                                                raise
+                                            wf_last_err = rec_err
+                                        except Exception as rec_err:
+                                            wf_last_err = rec_err
+                                        continue
+                                    break
+                                except Exception as wf_err:
+                                    if self.stop_requested:
+                                        break
+                                    err_low = str(wf_err).lower()
+                                    is_recoverable_nav = (
+                                        "execution context was destroyed" in err_low
+                                        or self._is_kicked_or_unauthorized(page)
+                                    )
+                                    wf_last_err = wf_err
+                                    if is_recoverable_nav and wf_attempt < MAX_RETRIES_ON_KICKOUT:
+                                        self.log(
+                                            f"  [!] Navigation/session hiccup inside Case Details for '{acc_no}' "
+                                            f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_err}). Re-logging & retrying..."
+                                        )
+                                        try:
+                                            self._login_and_restore_section(page, acc, section=section)
+                                            current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
+                                            if not current_matches:
+                                                wf = {
+                                                    "outcome": "ALL_SKIPPED",
+                                                    "billing_detail": "",
+                                                    "upload_status": "",
+                                                    "extracted_pdf": "-",
+                                                    "matched_row_detail": "-",
+                                                }
+                                                wf_last_err = None
+                                                break
+                                        except InvalidCredentialsError as rec_err:
+                                            if self._is_fatal_auth_error(rec_err):
+                                                raise
+                                            wf_last_err = rec_err
+                                        except Exception as rec_err:
+                                            wf_last_err = rec_err
+                                        continue
+                                    break
+
+                            if self.stop_requested:
+                                break
+                            if wf is None:
+                                self.log(f"  [ERROR] Workflow failed inside Case Details for '{acc_no}': {wf_last_err}")
+                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(wf_last_err))
                                 detailed_log.append({
                                     "Invoice No": case.get("Invoice No", ""),
                                     "Account No": acc_no,
@@ -4162,13 +4378,21 @@ class CProSuiteApp:
                                     "Matched By": s_label,
                                     "Billing Check": "Error",
                                     "Upload Status": "Error",
-                                    "C-PRO Row Details": str(wf_err),
+                                    "C-PRO Row Details": str(wf_last_err),
                                     "Round": round_label,
                                 })
                                 try:
                                     self._return_to_case_listing_and_restore_section(page, acc, section)
-                                except InvalidCredentialsError:
-                                    raise
+                                except InvalidCredentialsError as rec_err:
+                                    if self._is_fatal_auth_error(rec_err):
+                                        raise
+                                    try:
+                                        self._login_and_restore_section(page, acc, section=section)
+                                    except InvalidCredentialsError as rec_err2:
+                                        if self._is_fatal_auth_error(rec_err2):
+                                            raise
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
                                 pair_had_error = True
