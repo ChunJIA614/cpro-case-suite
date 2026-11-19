@@ -537,15 +537,8 @@ class PDFExtractorEngine:
 
     @staticmethod
     def _clean_borrower_short_name(full_name):
-        if not full_name:
-            return ""
-        short = re.split(
-            r"\s+(?:BIN|BINTI|B\.|BT\.|A/L|A/P|@)\s+",
-            full_name.strip(),
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0].strip()
-        return short or full_name.strip()
+        """Preserve the full borrower name (whitespace-normalized) without reducing BIN/BINTI/A/L/A/P."""
+        return re.sub(r"\s+", " ", str(full_name or "")).strip()
 
     @staticmethod
     def _is_billing_printout_text(upper_text):
@@ -1820,6 +1813,21 @@ class CProSuiteApp:
                     src_path = cand
                     break
 
+        full_name = re.sub(
+            r"\s+", " ", str(rec.get("Full Borrower Name") or rec.get("Search Name") or rec.get("Borrower Name") or "")
+        ).strip()
+        raw_search = re.sub(
+            r"\s+", " ", str(rec.get("Search Name") or rec.get("Borrower Name") or "")
+        ).strip()
+        # Upgrade previously truncated Search Name (e.g. "NOH") back to Full Borrower Name ("NOH BIN AWANG")
+        if full_name and (
+            not raw_search
+            or (len(full_name) > len(raw_search) and full_name.casefold().startswith(raw_search.casefold()))
+        ):
+            search_name = full_name
+        else:
+            search_name = raw_search or full_name
+
         return {
             "Source File": src_file,
             "Source PDF Path": src_path,
@@ -1829,8 +1837,8 @@ class CProSuiteApp:
             "Invoice Amount": inv_amt,
             "Account No": rec.get("Account No", "").strip(),
             "Alt Account No": rec.get("Alt Account No", "").strip(),
-            "Search Name": rec.get("Search Name", rec.get("Borrower Name", "")).strip(),
-            "Full Borrower Name": rec.get("Full Borrower Name", rec.get("Search Name", rec.get("Borrower Name", ""))).strip(),
+            "Search Name": search_name,
+            "Full Borrower Name": full_name,
             "Availability Status": rec.get("Availability Status", "").strip() or "Pending",
             "Found In Account(s)": rec.get("Found In Account(s)", "").strip() or "-",
             "Found In Section(s)": rec.get("Found In Section(s)", "").strip() or "-",
@@ -2179,6 +2187,7 @@ class CProSuiteApp:
         def _update(values, dialog):
             row_data["Account No"] = values["Account No"]
             row_data["Search Name"] = values["Search Name"]
+            row_data["Full Borrower Name"] = values["Search Name"]
             row_data["Invoice No"] = values["Invoice No"]
             d_raw = values["Invoice Date"]
             row_data["Invoice Date"] = format_date_dmy(d_raw) if d_raw else ""
@@ -4238,7 +4247,7 @@ class CProSuiteApp:
                 if self._is_case_done(case, verify_mode):
                     continue
                 acc_no = case.get("Account No", "").strip()
-                search_name = case.get("Search Name", "").strip()
+                search_name = (case.get("Search Name") or case.get("Full Borrower Name") or "").strip()
                 for sec in sections_slice:
                     if checked_pairs[idx].get((acc_idx, sec)) in ("NOT_FOUND", "MATCHED", "BILLING_MISMATCH"):
                         continue
@@ -4352,7 +4361,7 @@ class CProSuiteApp:
                         self.refresh_table(active_idx=idx)
                         acc_no = case.get("Account No", "").strip()
                         alt_acc_no = case.get("Alt Account No", "").strip()
-                        search_name = case.get("Search Name", "").strip()
+                        search_name = (case.get("Search Name") or case.get("Full Borrower Name") or "").strip()
 
                         search_attempts = []
                         if mode in ("ACCOUNT_THEN_NAME", "ACCOUNT_ONLY"):
