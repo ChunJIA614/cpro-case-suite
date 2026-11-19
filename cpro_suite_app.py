@@ -1183,7 +1183,17 @@ class CProSuiteApp:
 
         self.search_mode = tk.StringVar(value="ACCOUNT_THEN_NAME")
         self.verify_and_upload = tk.BooleanVar(value=True)
+        self.auto_run_after_upload = tk.BooleanVar(value=False)
         self.show_browser = tk.BooleanVar(value=True)
+
+        self.pdf_batch_filter_var = tk.StringVar(value="All Queued PDFs (0 files · 0 records)")
+        self._selected_pdf_source = "ALL"
+        self._pdf_combo_map = {"All Queued PDFs (0 files · 0 records)": "ALL"}
+        self.pdf_batch_status = {}
+        self.extracted_excel_paths = {}
+        self.report_excel_paths = {}
+        self._queued_pdf_paths = []
+        self._pdf_queue_lock = threading.Lock()
 
         self._configure_styles()
         self._build_layout()
@@ -1361,16 +1371,44 @@ class CProSuiteApp:
             wraplength=330,
             justify="left",
         ).pack(anchor="w", padx=(20, 0), pady=(1, 6))
+        tk.Checkbutton(
+            card2,
+            text="Auto-Run C-PRO After PDF Upload",
+            variable=self.auto_run_after_upload,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            activebackground=THEME["card"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 2))
+        tk.Label(
+            card2,
+            text="Processes queued PDFs sequentially one by one and saves separate Excel files for each PDF.",
+            font=("Segoe UI", 7),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=330,
+            justify="left",
+        ).pack(anchor="w", padx=(20, 0), pady=(0, 4))
 
         tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=8)
         tk.Checkbutton(card2, text="Show Live Chrome Browser", variable=self.show_browser, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9), anchor="w").pack(fill="x")
 
         card3_outer, card3 = self._create_card(sidebar)
         card3_outer.pack(fill="x", pady=(0, 12))
-        tk.Label(card3, text="EXCEL FILES & OUTPUTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 8))
+        tk.Label(card3, text="EXCEL FILES & OUTPUTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            card3,
+            text="Each PDF saves its own extracted_cases_<pdf>.xlsx and cpro_availability_report_<pdf>.xlsx.",
+            font=("Segoe UI", 7),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=330,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
 
-        self._create_button(card3, "Open Extracted Cases Excel", lambda: self._open_file(getattr(self, "last_extracted_path", EXTRACTED_EXCEL)), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
-        self._create_button(card3, "Open Final C-PRO Report Excel", lambda: self._open_file(getattr(self, "last_report_path", REPORT_EXCEL)), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
+        self._create_button(card3, "Open Extracted Cases Excel", self._open_selected_extracted_excel, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
+        self._create_button(card3, "Open Final C-PRO Report Excel", self._open_selected_report_excel, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
         self._create_button(card3, "📂 Open Output Folder", lambda: self._open_folder(OUTPUT_DIR), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x")
 
     def _add_account_row(self, username="", enabled=True):
@@ -1521,34 +1559,77 @@ class CProSuiteApp:
         self.btn_select_errors.pack(side="left")
 
         tip_row = tk.Frame(table_card, bg=THEME["card"], padx=16)
-        tip_row.pack(fill="x", pady=(0, 8))
+        tip_row.pack(fill="x", pady=(0, 6))
         tk.Label(
             tip_row,
-            text="Tip: Click ☑ to select rows · Double-click a row to edit Account / Date / Amount / Pages · Space to toggle · Delete to remove",
+            text="Tip: Queue multiple PDFs to run one by one automatically · Click ☑ to select rows · Double-click a row to edit · Space to toggle · Delete to remove",
             font=("Segoe UI", 8),
             bg=THEME["card"],
             fg=THEME["subtext"],
         ).pack(anchor="w")
+
+        pdf_queue_row = tk.Frame(table_card, bg="#F9F9FB", padx=16, pady=6)
+        pdf_queue_row.pack(fill="x")
+        tk.Label(
+            pdf_queue_row,
+            text="PDF Batch Queue:",
+            font=("Segoe UI Semibold", 8),
+            bg="#F9F9FB",
+            fg=THEME["subtext"],
+        ).pack(side="left", padx=(0, 6))
+        self.cmb_pdf_batch = ttk.Combobox(
+            pdf_queue_row,
+            textvariable=self.pdf_batch_filter_var,
+            state="readonly",
+            width=48,
+            font=("Segoe UI", 8),
+            values=["All Queued PDFs (0 files · 0 records)"],
+        )
+        self.cmb_pdf_batch.pack(side="left", padx=(0, 6))
+        self.cmb_pdf_batch.bind("<<ComboboxSelected>>", self.on_pdf_batch_filter_changed)
+
+        self.btn_select_pdf_batch = self._create_button(
+            pdf_queue_row, "☑ Select This PDF", self.on_select_current_pdf_batch,
+            bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=8, pady=2, font_size=8,
+        )
+        self.btn_select_pdf_batch.pack(side="left", padx=(0, 5))
+
+        self.btn_remove_pdf_batch = self._create_button(
+            pdf_queue_row, "✕ Remove PDF", self.on_remove_selected_pdf_batch,
+            bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=8, pady=2, font_size=8,
+        )
+        self.btn_remove_pdf_batch.pack(side="left", padx=(0, 8))
+
+        self.lbl_pdf_queue_summary = tk.Label(
+            pdf_queue_row,
+            text="0 PDF batches stored",
+            font=("Segoe UI", 8),
+            bg="#F9F9FB",
+            fg=THEME["subtext"],
+        )
+        self.lbl_pdf_queue_summary.pack(side="right")
+
         tk.Frame(table_card, bg=THEME["border"], height=1).pack(fill="x")
 
         tree_frame = tk.Frame(table_card, bg=THEME["card"])
         tree_frame.pack(fill="both", expand=True)
 
-        cols = ("check", "no", "inv_no", "acc_no", "search_name", "inv_date", "inv_amt", "pages", "status", "found_acc", "billing_check", "upload_status")
+        cols = ("check", "no", "source_file", "inv_no", "acc_no", "search_name", "inv_date", "inv_amt", "pages", "status", "found_acc", "billing_check", "upload_status")
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", style="Apple.Treeview", selectmode="extended")
         headings = [
             ("check", CHECKED_GLYPH, 40, "center", False),
-            ("no", "#", 40, "center", False),
-            ("inv_no", "Invoice No", 118, "w", False),
-            ("acc_no", "Account No", 122, "w", False),
-            ("search_name", "Borrower Name", 175, "w", True),
-            ("inv_date", "Inv Date", 88, "center", False),
-            ("inv_amt", "Inv Amt", 76, "e", False),
-            ("pages", "Pages", 56, "center", False),
-            ("status", "Status", 130, "center", False),
-            ("found_acc", "Account(s)", 98, "w", False),
-            ("billing_check", "Billing Check", 150, "w", True),
-            ("upload_status", "Upload Status", 135, "w", True),
+            ("no", "#", 38, "center", False),
+            ("source_file", "PDF File", 112, "w", False),
+            ("inv_no", "Invoice No", 115, "w", False),
+            ("acc_no", "Account No", 120, "w", False),
+            ("search_name", "Borrower Name", 170, "w", True),
+            ("inv_date", "Inv Date", 86, "center", False),
+            ("inv_amt", "Inv Amt", 74, "e", False),
+            ("pages", "Pages", 54, "center", False),
+            ("status", "Status", 126, "center", False),
+            ("found_acc", "Account(s)", 94, "w", False),
+            ("billing_check", "Billing Check", 145, "w", True),
+            ("upload_status", "Upload Status", 130, "w", True),
         ]
         for col_id, title, width, anchor, stretch in headings:
             self.tree.heading(col_id, text=title, anchor=anchor)
@@ -1618,8 +1699,12 @@ class CProSuiteApp:
         stop_state = "normal" if (running and allow_stop) else "disabled"
 
         def _apply():
+            # Allow queuing more PDFs even while automation is running
+            self.btn_upload_pdf.config(
+                state="normal",
+                text="＋ Queue More PDFs" if running else "＋ Upload & Extract PDFs",
+            )
             for btn in (
-                self.btn_upload_pdf,
                 self.btn_add_manual,
                 self.btn_load_excel,
                 self.btn_clear,
@@ -1628,28 +1713,160 @@ class CProSuiteApp:
                 self.btn_deselect_all,
                 self.btn_select_pending,
                 self.btn_select_errors,
+                self.btn_select_pdf_batch,
+                self.btn_remove_pdf_batch,
             ):
                 btn.config(state=state)
             self.btn_stop.config(state=stop_state)
 
         self.root.after(0, _apply)
 
+    @staticmethod
+    def _row_source_key(row):
+        return (row.get("Source File") or "").strip() or "Manual Entry"
+
+    def _get_ordered_source_files(self, indices=None):
+        seen = []
+        seen_set = set()
+        rows_iter = (self.cases_data[i] for i in indices) if indices is not None else self.cases_data
+        for row in rows_iter:
+            src = self._row_source_key(row)
+            if src not in seen_set:
+                seen_set.add(src)
+                seen.append(src)
+        return seen
+
+    def _infer_pdf_batch_status(self, source_file):
+        explicit = self.pdf_batch_status.get(source_file)
+        if explicit == "Running":
+            return "Running"
+        rows = [r for r in self.cases_data if self._row_source_key(r) == source_file]
+        if not rows:
+            return "Empty"
+        statuses = [r.get("Availability Status", "Pending") for r in rows]
+        if all(s == "Pending" for s in statuses):
+            return "Queued"
+        if any(s == "CHECK ERROR" for s in statuses):
+            return "Has Errors"
+        if any(s == "Pending" for s in statuses):
+            return "Partial"
+        return "Completed"
+
+    def _update_pdf_batch_selector(self):
+        sources = self._get_ordered_source_files()
+        total_rows = len(self.cases_data)
+        all_label = f"All Queued PDFs ({len(sources)} file{'s' if len(sources) != 1 else ''} · {total_rows} record{'s' if total_rows != 1 else ''})"
+        combo_map = {all_label: "ALL"}
+        values = [all_label]
+        selected_display = all_label
+
+        done_cnt = running_cnt = queued_cnt = err_cnt = 0
+        for idx, src in enumerate(sources, start=1):
+            src_rows = [r for r in self.cases_data if self._row_source_key(r) == src]
+            st = self._infer_pdf_batch_status(src)
+            if st == "Completed":
+                done_cnt += 1
+            elif st == "Running":
+                running_cnt += 1
+            elif st == "Has Errors":
+                err_cnt += 1
+            else:
+                queued_cnt += 1
+            label = f"[{idx}/{len(sources)}] {src} ({len(src_rows)} rows · {st})"
+            combo_map[label] = src
+            values.append(label)
+            if self._selected_pdf_source == src:
+                selected_display = label
+
+        if self._selected_pdf_source != "ALL" and self._selected_pdf_source not in sources:
+            self._selected_pdf_source = "ALL"
+            selected_display = all_label
+
+        self._pdf_combo_map = combo_map
+        if hasattr(self, "cmb_pdf_batch"):
+            self.cmb_pdf_batch["values"] = values
+            self.pdf_batch_filter_var.set(selected_display)
+        if hasattr(self, "lbl_pdf_queue_summary"):
+            with self._pdf_queue_lock:
+                waiting_extract = len(self._queued_pdf_paths)
+            parts = [f"{len(sources)} PDF batch{'es' if len(sources) != 1 else ''}"]
+            if done_cnt:
+                parts.append(f"{done_cnt} Done")
+            if running_cnt:
+                parts.append(f"{running_cnt} Running")
+            if queued_cnt:
+                parts.append(f"{queued_cnt} Queued")
+            if err_cnt:
+                parts.append(f"{err_cnt} With Errors")
+            if waiting_extract:
+                parts.append(f"+{waiting_extract} Pending Extract")
+            self.lbl_pdf_queue_summary.config(text=" · ".join(parts))
+
+    def on_pdf_batch_filter_changed(self, _event=None):
+        chosen_label = self.pdf_batch_filter_var.get()
+        self._selected_pdf_source = self._pdf_combo_map.get(chosen_label, "ALL")
+        self.refresh_table()
+
+    def on_select_current_pdf_batch(self):
+        if self.is_running or not self.cases_data:
+            return
+        if self._selected_pdf_source == "ALL":
+            self._set_all_checked(True)
+            return
+        target_src = self._selected_pdf_source
+        count = 0
+        for i, row in enumerate(self.cases_data):
+            match = self._row_source_key(row) == target_src
+            row["_checked"] = match
+            if match:
+                count += 1
+            iid = str(i)
+            if self.tree.exists(iid):
+                self.tree.set(iid, "check", CHECKED_GLYPH if match else UNCHECKED_GLYPH)
+        self._update_selection_summary()
+        self.log(f"Selected {count} row(s) from PDF batch '{target_src}'.")
+
+    def on_remove_selected_pdf_batch(self):
+        if self.is_running or not self.cases_data:
+            return
+        if self._selected_pdf_source == "ALL":
+            messagebox.showinfo(
+                "Select a PDF Batch",
+                "Choose a specific PDF file from the 'PDF Batch Queue' dropdown first to remove that PDF batch, or click 'Clear List' to clear everything.",
+                parent=self.root,
+            )
+            return
+        target_src = self._selected_pdf_source
+        before = len(self.cases_data)
+        self.cases_data = [r for r in self.cases_data if self._row_source_key(r) != target_src]
+        removed = before - len(self.cases_data)
+        self.pdf_batch_status.pop(target_src, None)
+        self._selected_pdf_source = "ALL"
+        self.refresh_table()
+        self._save_extracted_excel()
+        self.log(f"Removed PDF batch '{target_src}' ({removed} row(s)).")
+
     def _update_selection_summary(self):
         total = len(self.cases_data)
         checked = sum(1 for row in self.cases_data if row.get("_checked", True))
         error_count = sum(1 for row in self.cases_data if row.get("Availability Status") == "CHECK ERROR")
+        num_pdfs = len(self._get_ordered_source_files())
         if total == 0:
             self.lbl_case_count.config(text="Cases Queue (0 records)")
             self.tree.heading("check", text=UNCHECKED_GLYPH)
         else:
-            self.lbl_case_count.config(text=f"Cases Queue ({total} records · {checked} selected)")
+            self.lbl_case_count.config(
+                text=f"Cases Queue ({num_pdfs} PDF{'s' if num_pdfs != 1 else ''} · {total} records · {checked} selected)"
+            )
             self.tree.heading("check", text=CHECKED_GLYPH if checked == total else UNCHECKED_GLYPH)
         err_label = f"Select Errors ({error_count})" if error_count else "Select Errors"
         self.btn_select_errors.config(text=err_label)
+        self._update_pdf_batch_selector()
 
     def _set_all_checked(self, checked):
         for row in self.cases_data:
-            row["_checked"] = bool(checked)
+            if self._selected_pdf_source == "ALL" or self._row_source_key(row) == self._selected_pdf_source:
+                row["_checked"] = bool(checked)
         glyph = CHECKED_GLYPH if checked else UNCHECKED_GLYPH
         for iid in self.tree.get_children():
             self.tree.set(iid, "check", glyph)
@@ -1668,7 +1885,11 @@ class CProSuiteApp:
     def _toggle_all_checkboxes(self):
         if not self.cases_data:
             return
-        all_checked = all(row.get("_checked", True) for row in self.cases_data)
+        visible_rows = [
+            row for row in self.cases_data
+            if self._selected_pdf_source == "ALL" or self._row_source_key(row) == self._selected_pdf_source
+        ]
+        all_checked = all(row.get("_checked", True) for row in visible_rows)
         self._set_all_checked(not all_checked)
 
     def on_tree_click(self, event):
@@ -1744,7 +1965,11 @@ class CProSuiteApp:
             except Exception:
                 y_pos = 0.0
             self.tree.delete(*self.tree.get_children())
+            filter_src = getattr(self, "_selected_pdf_source", "ALL")
             for i, row in enumerate(self.cases_data):
+                src_name = self._row_source_key(row)
+                if filter_src != "ALL" and src_name != filter_src:
+                    continue
                 status = row.get("Availability Status", "Pending")
                 checked = row.get("_checked", True)
                 tag = ""
@@ -1768,6 +1993,7 @@ class CProSuiteApp:
                     values=(
                         CHECKED_GLYPH if checked else UNCHECKED_GLYPH,
                         i + 1,
+                        src_name,
                         row.get("Invoice No", ""),
                         row.get("Account No", ""),
                         row.get("Search Name", ""),
@@ -1914,32 +2140,121 @@ class CProSuiteApp:
                     break
         raise PermissionError(f"Could not save {description}. Last error: {last_error or first_error_text}")
 
-    def _save_extracted_excel(self):
+    @staticmethod
+    def _sanitize_pdf_stem(source_file):
+        raw = os.path.splitext(os.path.basename(str(source_file or "").strip()))[0]
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw).strip(" ._")
+        return safe or "manual_cases"
+
+    def _get_extracted_excel_path(self, source_file):
+        stem = self._sanitize_pdf_stem(source_file)
+        return os.path.join(OUTPUT_DIR, f"extracted_cases_{stem}.xlsx")
+
+    def _get_report_excel_path(self, source_file):
+        stem = self._sanitize_pdf_stem(source_file)
+        return os.path.join(OUTPUT_DIR, f"cpro_availability_report_{stem}.xlsx")
+
+    @staticmethod
+    def _write_cases_dataframe_to_excel(df_subset, export_cols, path):
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            df_subset[export_cols].to_excel(writer, index=False, sheet_name="To_Check")
+            ws = writer.sheets["To_Check"]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or "")) for cell in col) + 4
+                ws.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
+
+    def _save_extracted_excel(self, target_source_file=None):
         if not self.cases_data:
             return None
-        df = pd.DataFrame(self.cases_data)
         desired_cols = [
             "Source File", "Source PDF Path", "Invoice Pages", "Invoice No",
             "Invoice Date", "Invoice Amount", "Account No", "Alt Account No",
             "Search Name", "Full Borrower Name",
         ]
-        export_cols = [c for c in desired_cols if c in df.columns]
+        df_all = pd.DataFrame(self.cases_data)
+        export_cols = [c for c in desired_cols if c in df_all.columns]
 
-        def _write_workbook(path):
-            with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                df[export_cols].to_excel(writer, index=False, sheet_name="To_Check")
-                ws = writer.sheets["To_Check"]
-                for col in ws.columns:
-                    max_len = max(len(str(cell.value or "")) for cell in col) + 4
-                    ws.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
+        sources_to_save = (
+            [target_source_file]
+            if target_source_file
+            else self._get_ordered_source_files()
+        )
+        latest_per_pdf_path = None
+        for src_file in sources_to_save:
+            src_rows = [r for r in self.cases_data if self._row_source_key(r) == src_file]
+            if not src_rows:
+                continue
+            df_src = pd.DataFrame(src_rows)
+            src_cols = [c for c in desired_cols if c in df_src.columns]
+            per_pdf_pref = self._get_extracted_excel_path(src_file)
+            try:
+                saved_per_pdf = self._write_with_fallback(
+                    per_pdf_pref,
+                    lambda p, d=df_src, cols=src_cols: self._write_cases_dataframe_to_excel(d, cols, p),
+                    f"extracted cases for {src_file}",
+                )
+                self.extracted_excel_paths[src_file] = saved_per_pdf
+                self.last_extracted_path = saved_per_pdf
+                latest_per_pdf_path = saved_per_pdf
+            except Exception as e:
+                self.log(f"[ERROR] Could not save extracted cases for '{src_file}': {e}")
 
+        # Keep master extracted_cases.xlsx updated so all queued PDFs reload on next startup
         try:
-            saved_path = self._write_with_fallback(EXTRACTED_EXCEL, _write_workbook, "extracted cases")
-            self.last_extracted_path = saved_path
-            return saved_path
+            master_saved = self._write_with_fallback(
+                EXTRACTED_EXCEL,
+                lambda p: self._write_cases_dataframe_to_excel(df_all, export_cols, p),
+                "master extracted cases queue",
+            )
+            if latest_per_pdf_path is None:
+                self.last_extracted_path = master_saved
+                latest_per_pdf_path = master_saved
         except Exception as e:
-            self.log(f"[ERROR] Could not save extracted cases: {e}")
-            return None
+            self.log(f"[ERROR] Could not save master extracted cases queue: {e}")
+
+        return latest_per_pdf_path
+
+    def _save_report_excel_for_rows(self, rows_subset, detailed_subset, preferred_path, description):
+        summary_rows = [
+            {k: v for k, v in row.items() if not str(k).startswith("_")}
+            for row in rows_subset
+        ]
+        df_summary = pd.DataFrame(summary_rows)
+        if detailed_subset:
+            df_detailed = pd.DataFrame(detailed_subset)
+        else:
+            df_detailed = pd.DataFrame(columns=[
+                "Invoice No", "Account No", "Search Name", "C-PRO Account", "Login Used",
+                "Section", "Status", "Matched By", "Billing Check", "Upload Status",
+                "C-PRO Row Details", "Round",
+            ])
+
+        def _write_report(path):
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                df_summary.to_excel(writer, index=False, sheet_name="Summary_Report")
+                df_detailed.to_excel(writer, index=False, sheet_name="All_Checks_Detail")
+                for sheet in writer.sheets.values():
+                    for col in sheet.columns:
+                        max_len = max(len(str(cell.value or "")) for cell in col) + 4
+                        sheet.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
+
+        return self._write_with_fallback(preferred_path, _write_report, description)
+
+    def _open_selected_extracted_excel(self):
+        if self._selected_pdf_source != "ALL":
+            cand = self.extracted_excel_paths.get(self._selected_pdf_source) or self._get_extracted_excel_path(self._selected_pdf_source)
+            if os.path.exists(cand):
+                self._open_file(cand)
+                return
+        self._open_file(getattr(self, "last_extracted_path", EXTRACTED_EXCEL))
+
+    def _open_selected_report_excel(self):
+        if self._selected_pdf_source != "ALL":
+            cand = self.report_excel_paths.get(self._selected_pdf_source) or self._get_report_excel_path(self._selected_pdf_source)
+            if os.path.exists(cand):
+                self._open_file(cand)
+                return
+        self._open_file(getattr(self, "last_report_path", REPORT_EXCEL))
 
     def _open_file(self, filepath):
         if not os.path.exists(filepath):
@@ -1969,51 +2284,111 @@ class CProSuiteApp:
         except Exception as e:
             messagebox.showerror("Error Opening Folder", str(e))
 
+    def _extract_and_store_single_pdf(self, path, idx_label=""):
+        fname = os.path.basename(path)
+        prefix = f"({idx_label}) " if idx_label else ""
+        self.log(f"Scanning {prefix}{fname} ...")
+        extracted_cases = self.pdf_engine.extract_pdf(path, progress_cb=self.log)
+        if not extracted_cases:
+            self.log(f"  [!] No Invoices / Account Numbers found in {fname}")
+            return []
+
+        # Replace existing rows from the exact same PDF filename if re-uploaded, keeping all other PDFs intact
+        self.cases_data = [r for r in self.cases_data if self._row_source_key(r) != fname]
+        for case in extracted_cases:
+            self.cases_data.append(case)
+            inv_info = f"{case.get('Invoice No') or '-'} | {case.get('Invoice Date') or '-'} | RM {case.get('Invoice Amount') or '-'}"
+            self.log(f"  -> p.{case.get('Invoice Pages') or '?'} | {inv_info} | {case['Account No']} | {case['Search Name']}")
+
+        self.pdf_batch_status[fname] = "Queued"
+        saved_per_pdf = self._save_extracted_excel(target_source_file=fname)
+        if saved_per_pdf:
+            self.log(f"  [EXCEL] Saved {len(extracted_cases)} extracted record(s) for '{fname}' -> '{saved_per_pdf}'")
+        self.refresh_table()
+        return extracted_cases
+
+    def _drain_queued_pdfs_inline(self):
+        while not self.stop_requested:
+            with self._pdf_queue_lock:
+                if not self._queued_pdf_paths:
+                    break
+                next_pdf = self._queued_pdf_paths.pop(0)
+            fname = os.path.basename(next_pdf)
+            try:
+                self.set_status(f"Extracting queued PDF: {fname}...", bg="#EBF5FF", fg=THEME["blue"])
+                self._extract_and_store_single_pdf(next_pdf)
+            except Exception as e:
+                self.log(f"  [ERROR] Failed to extract queued PDF {fname}: {e}")
+
     def on_upload_pdfs(self):
-        if self.is_running:
-            return
         initial_dir = os.path.join(OUTPUT_DIR, "Scanned Invoice")
         if not os.path.isdir(initial_dir):
             initial_dir = OUTPUT_DIR
         pdf_files = filedialog.askopenfilenames(
             parent=self.root,
-            title="Select Invoice / Case PDF Files",
+            title="Select Invoice / Case PDF Files (Multiple PDFs Supported)",
             initialdir=initial_dir,
             filetypes=[("PDF Files", "*.pdf")],
         )
         if not pdf_files:
             return
 
+        # If automation or extraction is already running, queue the selected PDFs to run automatically after current batch
+        if self.is_running:
+            with self._pdf_queue_lock:
+                for p in pdf_files:
+                    if p not in self._queued_pdf_paths:
+                        self._queued_pdf_paths.append(p)
+            names = ", ".join(os.path.basename(p) for p in pdf_files)
+            self.log(f"[QUEUE] Queued {len(pdf_files)} additional PDF(s) ({names}) — will extract & run automatically in sequence.")
+            self.root.after(0, self._update_pdf_batch_selector)
+            return
+
+        # Uncheck already-finished rows from earlier runs so a subsequent run processes only pending/new PDF batches
+        for existing_row in self.cases_data:
+            if existing_row.get("Availability Status") not in ("Pending", "CHECK ERROR", ""):
+                existing_row["_checked"] = False
+
         self.is_running = True
         self._set_controls_running(True, allow_stop=False)
         self.set_status("Extracting PDFs...", bg="#EBF5FF", fg=THEME["blue"])
 
+        with self._pdf_queue_lock:
+            for p in pdf_files:
+                if p not in self._queued_pdf_paths:
+                    self._queued_pdf_paths.append(p)
+
         def _worker():
+            extracted_files_count = 0
             try:
-                total = len(pdf_files)
-                for idx, path in enumerate(pdf_files, start=1):
+                while not self.stop_requested:
+                    with self._pdf_queue_lock:
+                        if not self._queued_pdf_paths:
+                            break
+                        path = self._queued_pdf_paths.pop(0)
+                        remaining = len(self._queued_pdf_paths)
+                    extracted_files_count += 1
+                    total_seen = extracted_files_count + remaining
                     fname = os.path.basename(path)
-                    self.log(f"Scanning ({idx}/{total}): {fname} ...")
+                    self.set_status(f"Extracting PDF ({extracted_files_count}/{total_seen}): {fname}...", bg="#EBF5FF", fg=THEME["blue"])
                     try:
-                        extracted_cases = self.pdf_engine.extract_pdf(path, progress_cb=self.log)
-                        if not extracted_cases:
-                            self.log(f"  [!] No Invoices / Account Numbers found in {fname}")
-                        for case in extracted_cases:
-                            self.cases_data.append(case)
-                            inv_info = f"{case.get('Invoice No') or '-'} | {case.get('Invoice Date') or '-'} | RM {case.get('Invoice Amount') or '-'}"
-                            self.log(f"  -> p.{case.get('Invoice Pages') or '?'} | {inv_info} | {case['Account No']} | {case['Search Name']}")
-                        self.refresh_table()
+                        self._extract_and_store_single_pdf(path, idx_label=f"{extracted_files_count}/{total_seen}")
                     except Exception as e:
                         self.log(f"  [ERROR] Failed to extract {fname}: {e}")
-                    self.set_progress(idx, total)
+                    self.set_progress(extracted_files_count, total_seen)
 
-                saved_path = self._save_extracted_excel()
-                if saved_path:
-                    self.log(f"Saved {len(self.cases_data)} total record(s) to '{saved_path}'.")
+                num_batches = len(self._get_ordered_source_files())
+                self.log(
+                    f"Extraction complete: {extracted_files_count} PDF file(s) scanned into individual Excel files "
+                    f"({num_batches} total PDF batch(es) in queue, {len(self.cases_data)} total row(s))."
+                )
                 self.set_status("Ready", bg="#E8E8ED", fg=THEME["text"])
             finally:
                 self.is_running = False
                 self._set_controls_running(False)
+                if self.auto_run_after_upload.get() and not self.stop_requested and self.cases_data:
+                    self.log("[AUTO-RUN] Auto-starting sequential C-PRO check for queued PDF batch(es)...")
+                    self.root.after(150, self.on_start_cpro_check)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2219,8 +2594,12 @@ class CProSuiteApp:
     def on_clear_list(self):
         if self.is_running or not self.cases_data:
             return
-        if messagebox.askyesno("Clear Queue", "Remove all cases from the current list?"):
+        if messagebox.askyesno("Clear Queue", "Remove all cases and queued PDF batches from the current list?"):
             self.cases_data.clear()
+            self.pdf_batch_status.clear()
+            self._selected_pdf_source = "ALL"
+            with self._pdf_queue_lock:
+                self._queued_pdf_paths.clear()
             self.refresh_table()
 
     def on_stop_automation(self):
@@ -4711,123 +5090,215 @@ class CProSuiteApp:
                 except Exception:
                     pass
 
+    def _next_unprocessed_pdf_batch(self, processed_row_indices):
+        """Return (source_file, batch_row_indices) for the next queued PDF batch that has selected unprocessed rows."""
+        target_source = None
+        batch_indices = []
+        for idx, row in enumerate(self.cases_data):
+            if idx in processed_row_indices:
+                continue
+            if not row.get("_checked", True):
+                continue
+            src = self._row_source_key(row)
+            if target_source is None:
+                target_source = src
+            if src == target_source:
+                batch_indices.append(idx)
+        return target_source, batch_indices
+
+    def _count_remaining_pdf_batches(self, processed_row_indices):
+        rem_sources = set()
+        for idx, row in enumerate(self.cases_data):
+            if idx not in processed_row_indices and row.get("_checked", True):
+                rem_sources.add(self._row_source_key(row))
+        with self._pdf_queue_lock:
+            queued_files = len(self._queued_pdf_paths)
+        return len(rem_sources) + queued_files
+
     def _cpro_worker(self, active_accounts, active_sections, target_indices, mode, headless, verify_mode):
         found_tracker = {}
-        detailed_log = []
+        all_detailed_log = []
         recovery_resolved = False
+        processed_row_indices = set()
+        batch_reports = []
+        all_processed_indices = []
+
+        # Mark only the initial target_indices as checked for the start of this run; any newly queued PDFs added mid-run have _checked=True
+        target_set = set(target_indices)
+        for i, row in enumerate(self.cases_data):
+            row["_checked"] = i in target_set
 
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=headless, slow_mo=60)
                 try:
-                    self._run_check_pass(
-                        browser=browser,
-                        active_accounts=active_accounts,
-                        active_sections=active_sections,
-                        pass_indices=target_indices,
-                        found_tracker=found_tracker,
-                        detailed_log=detailed_log,
-                        mode=mode,
-                        verify_mode=verify_mode,
-                        round_label="Initial",
-                    )
+                    batch_num = 0
+                    while not self.stop_requested:
+                        # Extract any newly queued PDFs that were added while running
+                        self._drain_queued_pdfs_inline()
 
-                    initial_errors = sum(1 for i in target_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR")
-                    for recovery_round in range(1, MAX_ERROR_RECOVERY_ROUNDS + 1):
-                        if self.stop_requested:
-                            break
-                        error_indices = [
-                            idx for idx in target_indices
-                            if self.cases_data[idx].get("Availability Status") == "CHECK ERROR"
-                        ]
-                        if not error_indices:
-                            if initial_errors > 0:
-                                recovery_resolved = True
+                        source_file, batch_indices = self._next_unprocessed_pdf_batch(processed_row_indices)
+                        if not batch_indices:
                             break
 
+                        remaining_including_current = self._count_remaining_pdf_batches(processed_row_indices)
+                        batch_num += 1
+                        total_batches_est = (batch_num - 1) + remaining_including_current
+
+                        self.pdf_batch_status[source_file] = "Running"
+                        self.root.after(0, self._update_pdf_batch_selector)
                         self.log(
-                            f"[RECOVERY] Found {len(error_indices)} CHECK ERROR case(s). "
-                            f"Re-checking all enabled account(s) & section(s) (Round {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS})..."
+                            f"===================================================================="
+                        )
+                        self.log(
+                            f">>> [PDF BATCH {batch_num}/{total_batches_est}] Starting: {source_file} ({len(batch_indices)} case(s)) <<<"
+                        )
+                        self.log(
+                            f"===================================================================="
                         )
                         self.set_status(
-                            f"Re-checking errors ({recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS})...",
-                            bg="#FFF4D6",
-                            fg="#8A5A00",
+                            f"PDF {batch_num}/{total_batches_est}: {source_file} ({len(batch_indices)} cases)...",
+                            bg="#E8F8EE",
+                            fg=THEME["green"],
                         )
+
+                        batch_detailed_log = []
                         self._run_check_pass(
                             browser=browser,
                             active_accounts=active_accounts,
                             active_sections=active_sections,
-                            pass_indices=error_indices,
+                            pass_indices=batch_indices,
                             found_tracker=found_tracker,
-                            detailed_log=detailed_log,
+                            detailed_log=batch_detailed_log,
                             mode=mode,
                             verify_mode=verify_mode,
-                            round_label=f"Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}",
+                            round_label=f"{source_file} - Initial",
                         )
-                    else:
-                        if initial_errors > 0 and not any(
-                            self.cases_data[i].get("Availability Status") == "CHECK ERROR" for i in target_indices
-                        ):
-                            recovery_resolved = True
+
+                        initial_errors = sum(
+                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
+                        )
+                        for recovery_round in range(1, MAX_ERROR_RECOVERY_ROUNDS + 1):
+                            if self.stop_requested:
+                                break
+                            error_indices = [
+                                idx for idx in batch_indices
+                                if self.cases_data[idx].get("Availability Status") == "CHECK ERROR"
+                            ]
+                            if not error_indices:
+                                if initial_errors > 0:
+                                    recovery_resolved = True
+                                break
+
+                            self.log(
+                                f"[RECOVERY] [{source_file}] Found {len(error_indices)} CHECK ERROR case(s). "
+                                f"Re-checking all enabled account(s) & section(s) (Round {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS})..."
+                            )
+                            self.set_status(
+                                f"PDF {batch_num}/{total_batches_est} ({source_file}): Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}...",
+                                bg="#FFF4D6",
+                                fg="#8A5A00",
+                            )
+                            self._run_check_pass(
+                                browser=browser,
+                                active_accounts=active_accounts,
+                                active_sections=active_sections,
+                                pass_indices=error_indices,
+                                found_tracker=found_tracker,
+                                detailed_log=batch_detailed_log,
+                                mode=mode,
+                                verify_mode=verify_mode,
+                                round_label=f"{source_file} - Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}",
+                            )
+                        else:
+                            if initial_errors > 0 and not any(
+                                self.cases_data[i].get("Availability Status") == "CHECK ERROR" for i in batch_indices
+                            ):
+                                recovery_resolved = True
+
+                        processed_row_indices.update(batch_indices)
+                        all_processed_indices.extend(batch_indices)
+                        all_detailed_log.extend(batch_detailed_log)
+
+                        # Save this PDF batch's own extracted Excel and its own C-PRO report Excel immediately!
+                        self._save_extracted_excel(target_source_file=source_file)
+                        batch_rows = [
+                            row for row in self.cases_data if self._row_source_key(row) == source_file
+                        ]
+                        per_pdf_pref = self._get_report_excel_path(source_file)
+                        per_pdf_report_path = self._save_report_excel_for_rows(
+                            batch_rows,
+                            batch_detailed_log,
+                            per_pdf_pref,
+                            f"C-PRO report for {source_file}",
+                        )
+                        self.report_excel_paths[source_file] = per_pdf_report_path
+                        self.last_report_path = per_pdf_report_path
+                        batch_err_cnt = sum(
+                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
+                        )
+                        batch_ok_cnt = sum(
+                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE")
+                        )
+                        self.pdf_batch_status[source_file] = "Has Errors" if batch_err_cnt else "Completed"
+                        self.root.after(0, self._update_pdf_batch_selector)
+                        batch_reports.append((source_file, len(batch_indices), batch_ok_cnt, batch_err_cnt, per_pdf_report_path))
+                        self.log(
+                            f">>> [PDF BATCH {batch_num}/{total_batches_est} DONE] {source_file}: "
+                            f"{batch_ok_cnt}/{len(batch_indices)} complete -> Report saved to '{per_pdf_report_path}' <<<"
+                        )
                 finally:
                     browser.close()
 
-            summary_rows = [
-                {k: v for k, v in row.items() if not str(k).startswith("_")}
-                for row in self.cases_data
-            ]
-            df_summary = pd.DataFrame(summary_rows)
-            if detailed_log:
-                df_detailed = pd.DataFrame(detailed_log)
-            else:
-                df_detailed = pd.DataFrame(columns=[
-                    "Invoice No", "Account No", "Search Name", "C-PRO Account", "Login Used",
-                    "Section", "Status", "Matched By", "Billing Check", "Upload Status",
-                    "C-PRO Row Details", "Round",
-                ])
+            # Also save master combined report across all rows
+            master_report_path = self._save_report_excel_for_rows(
+                self.cases_data,
+                all_detailed_log,
+                REPORT_EXCEL,
+                "C-PRO master availability report",
+            )
+            if not batch_reports:
+                self.last_report_path = master_report_path
+            self.log(f"All queued PDF batches finished! Master report saved to '{master_report_path}'.")
 
-            def _write_report(path):
-                with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                    df_summary.to_excel(writer, index=False, sheet_name="Summary_Report")
-                    df_detailed.to_excel(writer, index=False, sheet_name="All_Checks_Detail")
-                    for sheet in writer.sheets.values():
-                        for col in sheet.columns:
-                            max_len = max(len(str(cell.value or "")) for cell in col) + 4
-                            sheet.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
+            open_dir = os.path.abspath(os.path.dirname(self.last_report_path or master_report_path))
+            self.root.after(0, lambda d=open_dir: self._open_folder(d))
 
-            report_path = self._write_with_fallback(REPORT_EXCEL, _write_report, "C-PRO availability report")
-            self.last_report_path = report_path
-            self.log(f"Done! Full report saved to '{report_path}'.")
-
-            self.root.after(0, lambda: self._open_folder(os.path.abspath(os.path.dirname(report_path))))
-
-            incomplete_count = sum(1 for i in target_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR")
-            complete_count = sum(1 for i in target_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE"))
+            eval_indices = all_processed_indices or target_indices
+            incomplete_count = sum(1 for i in eval_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR")
+            complete_count = sum(1 for i in eval_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE"))
+            reports_summary_lines = "\n".join(
+                f"• {src} ({ok}/{tot} complete) → {os.path.basename(rpath)}"
+                for src, tot, ok, _err, rpath in batch_reports
+            )
             if self.stop_requested:
                 self.set_status("Stopped", bg="#FFF2F2", fg=THEME["red"])
                 completion_title = "C-PRO Check Stopped"
                 completion_message = (
-                    f"C-PRO run was stopped ({len(target_indices)} selected case(s) queued).\n"
+                    f"C-PRO run was stopped ({len(eval_indices)} case(s) across {len(batch_reports)} PDF batch(es)).\n"
                     + (f"{incomplete_count} case(s) currently have CHECK ERROR.\n" if incomplete_count else "")
-                    + f"\nPartial report saved to:\n{report_path}"
+                    + (f"\nPer-PDF Reports Saved:\n{reports_summary_lines}\n" if reports_summary_lines else "")
+                    + f"\nMaster Report:\n{master_report_path}"
                 )
             elif incomplete_count:
                 self.log(f"[WARNING] {incomplete_count} case(s) still have CHECK ERROR after {MAX_ERROR_RECOVERY_ROUNDS} recovery round(s).")
                 self.set_status("Completed with errors", bg="#FFF4D6", fg="#8A5A00")
                 completion_title = "C-PRO Check Finished with Incomplete Searches"
                 completion_message = (
-                    f"Finished processing {len(target_indices)} selected case(s) ({complete_count} complete), "
+                    f"Finished {len(batch_reports)} PDF batch(es) ({len(eval_indices)} case(s), {complete_count} complete), "
                     f"but {incomplete_count} case(s) still have CHECK ERROR.\n\n"
-                    f"Click 'Select Errors' to re-check those rows.\n\nReport saved to:\n{report_path}"
+                    f"Click 'Select Errors' to re-check those rows.\n\n"
+                    + (f"Per-PDF Reports Saved:\n{reports_summary_lines}\n\n" if reports_summary_lines else "")
+                    + f"Master Report:\n{master_report_path}"
                 )
             else:
                 self.set_status("Completed", bg="#E8F8EE", fg=THEME["green"])
                 completion_title = "C-PRO Automation Complete"
                 extra = " All initial error cases were automatically re-checked and resolved!" if recovery_resolved else ""
                 completion_message = (
-                    f"Finished processing {len(target_indices)} selected case(s)! "
-                    f"({complete_count} complete){extra}\n\nReport saved to:\n{report_path}"
+                    f"Finished processing {len(batch_reports)} PDF batch(es) ({len(eval_indices)} case(s), {complete_count} complete)!{extra}\n\n"
+                    + (f"Per-PDF Reports Saved:\n{reports_summary_lines}\n\n" if reports_summary_lines else "")
+                    + f"Master Report:\n{master_report_path}"
                 )
 
             self.root.after(0, lambda title=completion_title, msg=completion_message: messagebox.showinfo(title, msg, parent=self.root))

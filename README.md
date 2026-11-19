@@ -60,7 +60,11 @@ Law firms acting on behalf of banking institutions frequently process large scan
 - **Multi-Signal Amount & Metadata Extraction**: Extracts `Invoice No`, `Invoice Date`, `Invoice Amount` (cross-checked via `RINGGIT MALAYSIA` words, `Sub Total + Service Tax`, and totals), `Account No`, `Alt Account No` (paired `&` accounts and credit card `c:` numbers), `Borrower Name`, and exact `Invoice Pages`.
 
 ### 🌐 Automated Billing Verification & E-INVOICE Upload
-- **All-Account Checking per Borrower**: Checks every extracted account number (`Account No` + `Alt Account No`), checks **all** matching rows returned by C-PRO (across grid pagination if needed), and—under `Account No → Fallback to Name`—checks remaining `Primary Borrower Name` matches if earlier rows fail Billing verification.
+- **Multi-PDF Batch Queue & Sequential One-by-One Execution**:
+  - Store and queue multiple invoice PDFs at once (or click **`＋ Queue More PDFs`** while automation is already running to append additional PDF batches).
+  - View all queued PDFs together or filter by individual PDF batch via the **PDF Batch Queue** selector bar (`[1/N] <pdf_name> (<rows> · Queued/Running/Completed)`), with optional **Auto-Run C-PRO After PDF Upload**.
+  - Runs each queued PDF batch sequentially **one by one** from start to finish (including automatic `CHECK ERROR` recovery for that PDF) and immediately saves that PDF's dedicated Excel report before moving to the next PDF.
+- **All-Account & Full-Name Checking per Borrower**: Checks every extracted account number (`Account No` + `Alt Account No`), checks **all** matching rows returned by C-PRO (across grid pagination if needed), and—under `Account No → Fallback to Name`—searches the **full borrower name** (preserving `BIN`, `BINTI`, `A/L`, `A/P`, etc.) if earlier rows fail Billing verification.
 - **Billings Tab Date & Amount Verification**: Opens **Case Details** → **Billings** → **Billing History (`All`)**, excludes `Rejected` rows, and matches either a single row or any combination/sum of rows on the exact `Invoice Date`. If no match is found, treats that match as `None` and keeps checking remaining rows, sections, and accounts (`NONE (Billing Mismatch)` if none match).
 - **Case Withdrawn Upload Rule**: For **Case Withdrawn**, verifies *Billings* Date & Amount and automatically **skips** uploading `E-INVOICE` (`COMPLETE`, `Skipped upload (Case Withdrawn)`).
 - **Eye-Preview Duplicate Check & Targeted PDF Upload**: For **Case In Progress** and **Case Withhold**:
@@ -68,16 +72,20 @@ Law firms acting on behalf of banking institutions frequently process large scan
   2. For any existing `E-INVOICE` row, clicks the **Eye (Preview)** icon, inspects the `Preview Document` modal (PDF network/embed bytes or screenshot OCR, with Download fallback), and only skips if it matches the target `Invoice No` / `Date & Amount`.
   3. Otherwise, extracts **only** that invoice's page(s) into `extracted_invoices/` and submits **Add New Document** (`Document Name = E-INVOICE`, `Document Type = Others`, blank `Remark`) before marking the case **`COMPLETE`**.
 - **Configurable Verification Toggle**: Toggle **Verify Billings & Upload E-INVOICE** in the sidebar to run the full end-to-end workflow or availability-only checking.
-- **Row Controls & Error Recovery**: Interactive row checkboxes (`☑` / `☐`), **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**, double-click inline row editing (Account, Name, Invoice No, Date, Amount, Source PDF, Pages), and up to 3 automatic `CHECK ERROR` recovery passes.
+- **Row Controls & Error Recovery**: Interactive row checkboxes (`☑` / `☐`), **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**, **`☑ Select This PDF`**, **`✕ Remove PDF`**, DPI-aware scrollable double-click row editing (Account, Name, Invoice No, Date, Amount, Source PDF, Pages), and up to 3 automatic `CHECK ERROR` recovery passes per PDF batch.
 
 ### 🛡️ DevExtreme dxDataGrid Stabilization & Session Recovery
 - **Active XHR & Fetch Tracking**: Monitors in-flight requests and DevExtreme load panels before reading tables.
 - **DOM Signature Verification**: Waits for debounced row/empty-state stability to eliminate stale reads.
 - **Auto-Dismiss Session Timeout Warning**: Automatically detects C-PRO's `Session Timeout Warning` popup (`"Your session will expire in ... seconds"`) via Playwright's locator handler and polling checks, clicking **`Stay`** immediately to prevent forced logout and click interception.
+- **Portal Role-Selection (`LAW FIRM`) Auto-Entry**: Automatically detects when C-PRO logs out to the *"Welcome Back / Sign in to get started"* portal role selector and clicks **`LAW FIRM`** to enter the login page.
 - **Anti-Kickout Auto-Recovery**: Detects session kickouts/timeouts (`"Logged in from another location"`, `"Error! Unauthenticated"`), re-authenticates, restores the active section, and continues seamlessly.
 
-### 📊 Resilient Excel & PDF Output Management
-- **Two Comprehensive Worksheets**: `Summary_Report` and `All_Checks_Detail` in `cpro_availability_report.xlsx`, plus `extracted_cases.xlsx` queue persistence.
+### 📊 Per-PDF & Master Excel Output Management
+- **Separate Excel Files per PDF**:
+  - **Per-PDF Extracted Cases**: `extracted_cases_<pdf_name>.xlsx` is saved immediately as each PDF is scanned/extracted.
+  - **Per-PDF Final C-PRO Report**: `cpro_availability_report_<pdf_name>.xlsx` (with `Summary_Report` and `All_Checks_Detail` worksheets for that specific PDF) is saved immediately when each PDF batch completes its C-PRO check.
+  - **Master Combined Queue & Report**: Also maintains `extracted_cases.xlsx` and `cpro_availability_report.xlsx` across all queued PDF batches.
 - **Lock-Resistant Fallback System**: Automatically saves timestamped fallbacks in writable system folders (`Script Directory` → `Desktop` → `Documents` → `AppData` → `Temp`) if Excel locks the target workbook.
 
 ---
