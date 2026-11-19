@@ -2334,12 +2334,108 @@ class CProSuiteApp:
         ).filter(has_text=re.compile(r"Session\s*Timeout\s*Warning|Your\s+session\s+will\s+expire", re.I)).first
         page.add_locator_handler(warn_loc, lambda: self._dismiss_session_timeout_warning(page, from_handler=True))
 
+    @staticmethod
+    def _is_portal_role_select_page(page):
+        """Return True when C-PRO is showing the 'Welcome Back' portal selector (LAW FIRM, MG VALUER, etc.)."""
+        try:
+            return bool(page.evaluate("""() => {
+                const text = (document.body && (document.body.innerText || document.body.textContent) || '').trim();
+                if (!text) return false;
+                const upper = text.toUpperCase();
+                if (!/\\bLAW\\s*FIRM\\b/.test(upper)) return false;
+                const hasRoleList = (
+                    upper.includes('MG VALUER')
+                    || upper.includes('MG AUCTIONEER')
+                    || upper.includes('HP AUCTIONEER')
+                );
+                const hasWelcome = (
+                    upper.includes('WELCOME BACK')
+                    && upper.includes('SIGN IN TO GET STARTED')
+                );
+                return hasRoleList || hasWelcome;
+            }"""))
+        except Exception:
+            return False
+
+    def _click_law_firm_portal_if_present(self, page):
+        """Click the 'LAW FIRM' option on the C-PRO portal selector page to enter the login page."""
+        if not self._is_portal_role_select_page(page):
+            return False
+        pattern = re.compile(r"^\s*LAW\s*FIRM\s*$", re.I)
+        candidates = (
+            page.locator("a, button, [role='button'], [tabindex]").filter(has_text=pattern),
+            page.get_by_text(pattern),
+        )
+        clicked = False
+        for loc in candidates:
+            try:
+                count = min(loc.count(), 10)
+            except Exception:
+                count = 0
+            for idx in range(count):
+                el = loc.nth(idx)
+                try:
+                    if not el.is_visible():
+                        continue
+                    el.scroll_into_view_if_needed(timeout=2000)
+                    el.click(timeout=5000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if clicked:
+                break
+        if not clicked:
+            # Fallback JS click in case an Angular/SPA click handler is bound on a non-standard wrapper
+            try:
+                clicked = bool(page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('a, button, [role="button"], li, div, span, p, h1, h2, h3, h4'));
+                    for (const el of els) {
+                        const txt = (el.innerText || el.textContent || '').trim();
+                        if (/^LAW\\s*FIRM$/i.test(txt) && el.offsetParent !== null) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""))
+            except Exception:
+                clicked = False
+        if not clicked:
+            return False
+
+        self.log("[AUTH] Portal role-selection page detected; clicked 'LAW FIRM' to enter login page.")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        self._wait_for_network_quiet(page, timeout=4000)
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if self.stop_requested:
+                break
+            try:
+                if (
+                    page.locator("button:has-text('Sign In')").first.is_visible()
+                    or page.locator("input[type='password']").first.is_visible()
+                ):
+                    break
+                if "case-listing" in page.url.lower() and not self._is_portal_role_select_page(page):
+                    break
+            except Exception:
+                pass
+            page.wait_for_timeout(250)
+        return True
+
     def _is_kicked_or_unauthorized(self, page):
         try:
             self._dismiss_session_timeout_warning(page)
+            if self._is_portal_role_select_page(page):
+                return True
             if "login" in page.url.lower() or "auth" in page.url.lower():
                 return True
-            if page.locator("button:has-text('Sign In')").is_visible():
+            if page.locator("button:has-text('Sign In')").first.is_visible():
                 return True
             toast_error = page.locator("text=/Error! Unauthenticated|Unauthenticated|Session expired|Logged in from another/i")
             if toast_error.count() > 0 and toast_error.first.is_visible():
@@ -2550,19 +2646,42 @@ class CProSuiteApp:
             pass
 
         for login_attempt in range(2):
-            for nav_try in range(2):
-                try:
-                    page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=45000)
-                    break
-                except PlaywrightTimeoutError:
-                    if nav_try == 1:
-                        raise
-                    self.log(f"[AUTH] Navigation timed out for {username}; retrying once...")
-                    page.wait_for_timeout(1000)
-            self._wait_for_network_quiet(page, timeout=4000)
-            page.wait_for_timeout(300)
+            self._click_law_firm_portal_if_present(page)
+            if not page.locator("button:has-text('Sign In')").first.is_visible():
+                for nav_try in range(2):
+                    try:
+                        page.goto(CASE_LISTING_URL, wait_until="domcontentloaded", timeout=45000)
+                        break
+                    except PlaywrightTimeoutError:
+                        if nav_try == 1:
+                            raise
+                        self.log(f"[AUTH] Navigation timed out for {username}; retrying once...")
+                        page.wait_for_timeout(1000)
+                self._wait_for_network_quiet(page, timeout=4000)
 
-            sign_in = page.locator("button:has-text('Sign In')")
+                auth_settle_deadline = time.monotonic() + 6.0
+                while time.monotonic() < auth_settle_deadline:
+                    if self.stop_requested:
+                        break
+                    if self._click_law_firm_portal_if_present(page):
+                        continue
+                    try:
+                        if page.locator("button:has-text('Sign In')").first.is_visible():
+                            break
+                        if (
+                            "case-listing" in page.url.lower()
+                            and not self._is_kicked_or_unauthorized(page)
+                            and (
+                                page.locator(".dx-datagrid:visible").count() > 0
+                                or page.locator("text=/Case In Progress|Case Withdrawn|Case Withhold/i").count() > 0
+                            )
+                        ):
+                            break
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(250)
+
+            sign_in = page.locator("button:has-text('Sign In')").first
             user_input = page.locator("input[placeholder*='Username' i], input[name*='user' i], input[type='text']").first
             if sign_in.is_visible():
                 if not user_input.is_visible():
@@ -2580,14 +2699,21 @@ class CProSuiteApp:
                     rejection = self._login_rejection_text(page)
                     if rejection:
                         break
-                    if "case-listing" in page.url.lower() and not page.locator("input[type='password']").is_visible():
+                    if (
+                        "case-listing" in page.url.lower()
+                        and not self._is_portal_role_select_page(page)
+                        and not page.locator("input[type='password']").first.is_visible()
+                    ):
                         break
                     page.wait_for_timeout(250)
 
                 rejection = rejection or self._login_rejection_text(page)
                 if not rejection:
                     try:
-                        if page.locator("button:has-text('Sign In')").is_visible() and page.locator("input[type='password']").is_visible():
+                        if (
+                            page.locator("button:has-text('Sign In')").first.is_visible()
+                            and page.locator("input[type='password']").first.is_visible()
+                        ):
                             rejection = "C-PRO remained on the sign-in form"
                     except Exception:
                         pass
