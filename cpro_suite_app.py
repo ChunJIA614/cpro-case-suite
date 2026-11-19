@@ -2026,49 +2026,121 @@ class CProSuiteApp:
         except Exception as e:
             messagebox.showerror("Import Error", str(e))
 
+    def _open_case_form_dialog(self, title, field_specs, submit_label, on_submit):
+        """Open a DPI-aware, auto-sized, scrollable modal form dialog centered over the app."""
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.configure(bg=THEME["card"])
+        dialog.resizable(True, True)
+        dialog.transient(self.root)
+
+        footer = tk.Frame(dialog, bg=THEME["card"], padx=20, pady=12)
+        footer.pack(side="bottom", fill="x")
+
+        body_wrap = tk.Frame(dialog, bg=THEME["card"])
+        body_wrap.pack(side="top", fill="both", expand=True)
+
+        canvas = tk.Canvas(body_wrap, bg=THEME["card"], highlightthickness=0, bd=0)
+        v_scroll = ttk.Scrollbar(body_wrap, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=v_scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+
+        form_frame = tk.Frame(canvas, bg=THEME["card"], padx=20, pady=14)
+        canvas_window = canvas.create_window((0, 0), window=form_frame, anchor="nw")
+
+        entries = {}
+        for key, label_text, initial_val in field_specs:
+            tk.Label(
+                form_frame, text=label_text, bg=THEME["card"], fg=THEME["text"], font=("Segoe UI Semibold", 9)
+            ).pack(anchor="w")
+            ent = tk.Entry(form_frame, bg=THEME["input_bg"], relief="flat", bd=5, font=("Segoe UI", 9))
+            if initial_val:
+                ent.insert(0, str(initial_val))
+            ent.pack(fill="x", pady=(2, 8))
+            entries[key] = ent
+
+        def _sync_scroll_region(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_form_width(event):
+            canvas.itemconfigure(canvas_window, width=event.width)
+
+        form_frame.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_form_width)
+
+        def _on_mousewheel(event):
+            if canvas.winfo_height() < form_frame.winfo_reqheight():
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        dialog.bind("<MouseWheel>", _on_mousewheel)
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+
+        def _handle_submit():
+            values = {k: ent.get().strip() for k, ent in entries.items()}
+            on_submit(values, dialog)
+
+        self._create_button(
+            footer, submit_label, _handle_submit, bg=THEME["blue"], hover_bg=THEME["blue_hover"]
+        ).pack(fill="x")
+
+        dialog.update_idletasks()
+        screen_w = dialog.winfo_screenwidth()
+        screen_h = dialog.winfo_screenheight()
+        req_w = max(500, form_frame.winfo_reqwidth() + 28, footer.winfo_reqwidth() + 28)
+        req_form_h = form_frame.winfo_reqheight()
+        req_footer_h = footer.winfo_reqheight()
+        total_req_h = req_form_h + req_footer_h + 12
+
+        win_w = min(req_w, int(screen_w * 0.90))
+        max_h = int(screen_h * 0.88)
+        win_h = min(total_req_h, max_h)
+        if total_req_h > max_h:
+            v_scroll.pack(side="right", fill="y")
+            win_w = min(win_w + 18, int(screen_w * 0.90))
+
+        self.root.update_idletasks()
+        parent_x = self.root.winfo_rootx()
+        parent_y = self.root.winfo_rooty()
+        parent_w = self.root.winfo_width() or screen_w
+        parent_h = self.root.winfo_height() or screen_h
+        pos_x = max(0, min(screen_w - win_w, parent_x + (parent_w - win_w) // 2))
+        pos_y = max(0, min(screen_h - win_h, parent_y + (parent_h - win_h) // 2))
+
+        dialog.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        dialog.minsize(min(440, win_w), min(360, win_h))
+        dialog.deiconify()
+        dialog.grab_set()
+        if field_specs:
+            entries[field_specs[0][0]].focus_set()
+        return dialog
+
     def on_add_manual_row(self):
         if self.is_running:
             return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Add Case Manually")
-        dialog.geometry("430x420")
-        dialog.configure(bg=THEME["card"])
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        specs = [
+            ("Account No", "Account No:", ""),
+            ("Search Name", "Borrower Name:", ""),
+            ("Invoice No", "Invoice No (optional):", ""),
+            ("Invoice Date", "Invoice Date (DD/MM/YYYY):", ""),
+            ("Invoice Amount", "Invoice Amount RM (e.g. 113.40):", ""),
+            ("Source PDF Path", "Source PDF Path (optional):", ""),
+            ("Invoice Pages", "Invoice Pages in PDF (e.g. 1 or 13-14):", ""),
+        ]
 
-        frame = tk.Frame(dialog, bg=THEME["card"], padx=20, pady=16)
-        frame.pack(fill="both", expand=True)
-
-        def _add_field(label_text, default_val=""):
-            tk.Label(frame, text=label_text, bg=THEME["card"], fg=THEME["text"], font=("Segoe UI Semibold", 9)).pack(anchor="w")
-            ent = tk.Entry(frame, bg=THEME["input_bg"], relief="flat", bd=5, font=("Segoe UI", 9))
-            if default_val:
-                ent.insert(0, default_val)
-            ent.pack(fill="x", pady=(2, 8))
-            return ent
-
-        ent_acc = _add_field("Account No:")
-        ent_name = _add_field("Borrower Name:")
-        ent_inv_no = _add_field("Invoice No (optional):")
-        ent_date = _add_field("Invoice Date (DD/MM/YYYY):")
-        ent_amt = _add_field("Invoice Amount RM (e.g. 113.40):")
-        ent_pdf = _add_field("Source PDF Path (optional):")
-        ent_pages = _add_field("Invoice Pages in PDF (e.g. 1 or 13-14):")
-
-        def _save():
-            acc = ent_acc.get().strip()
-            name = ent_name.get().strip()
+        def _save(values, dialog):
+            acc = values["Account No"]
+            name = values["Search Name"]
             if not acc and not name:
                 messagebox.showwarning("Input Required", "Please enter an Account No or Borrower Name.", parent=dialog)
                 return
             rec = self._normalize_imported_row({
-                "Source File": os.path.basename(ent_pdf.get().strip()) or "Manual Entry",
-                "Source PDF Path": ent_pdf.get().strip(),
-                "Invoice Pages": ent_pages.get().strip(),
-                "Invoice No": ent_inv_no.get().strip(),
-                "Invoice Date": ent_date.get().strip(),
-                "Invoice Amount": ent_amt.get().strip(),
+                "Source File": os.path.basename(values["Source PDF Path"]) or "Manual Entry",
+                "Source PDF Path": values["Source PDF Path"],
+                "Invoice Pages": values["Invoice Pages"],
+                "Invoice No": values["Invoice No"],
+                "Invoice Date": values["Invoice Date"],
+                "Invoice Amount": values["Invoice Amount"],
                 "Account No": acc,
                 "Search Name": name,
                 "Full Borrower Name": name,
@@ -2078,7 +2150,7 @@ class CProSuiteApp:
             self._save_extracted_excel()
             dialog.destroy()
 
-        self._create_button(frame, "Add to Queue", _save, bg=THEME["blue"], hover_bg=THEME["blue_hover"]).pack(fill="x", pady=(4, 0))
+        self._open_case_form_dialog("Add Case Manually", specs, "Add to Queue", _save)
 
     def on_double_click_row(self, event):
         if self.is_running:
@@ -2094,50 +2166,34 @@ class CProSuiteApp:
         idx = int(iid)
         row_data = self.cases_data[idx]
 
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"Edit Row #{idx + 1}")
-        dialog.geometry("450x460")
-        dialog.configure(bg=THEME["card"])
-        dialog.resizable(False, False)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        specs = [
+            ("Account No", "Account No:", row_data.get("Account No", "")),
+            ("Search Name", "Search Name:", row_data.get("Search Name", "")),
+            ("Invoice No", "Invoice No:", row_data.get("Invoice No", "")),
+            ("Invoice Date", "Invoice Date (DD/MM/YYYY):", row_data.get("Invoice Date", "")),
+            ("Invoice Amount", "Invoice Amount RM (e.g. 113.40):", row_data.get("Invoice Amount", "")),
+            ("Source PDF Path", "Source PDF Path:", row_data.get("Source PDF Path", "")),
+            ("Invoice Pages", "Invoice Pages (e.g. 1 or 13-14):", row_data.get("Invoice Pages", "")),
+        ]
 
-        frame = tk.Frame(dialog, bg=THEME["card"], padx=20, pady=16)
-        frame.pack(fill="both", expand=True)
-
-        def _field(label, key):
-            tk.Label(frame, text=label, bg=THEME["card"], fg=THEME["text"], font=("Segoe UI Semibold", 9)).pack(anchor="w")
-            ent = tk.Entry(frame, bg=THEME["input_bg"], relief="flat", bd=5, font=("Segoe UI", 9))
-            ent.insert(0, row_data.get(key, ""))
-            ent.pack(fill="x", pady=(2, 8))
-            return ent
-
-        ent_acc = _field("Account No:", "Account No")
-        ent_name = _field("Search Name:", "Search Name")
-        ent_inv_no = _field("Invoice No:", "Invoice No")
-        ent_date = _field("Invoice Date (DD/MM/YYYY):", "Invoice Date")
-        ent_amt = _field("Invoice Amount RM (e.g. 113.40):", "Invoice Amount")
-        ent_pdf = _field("Source PDF Path:", "Source PDF Path")
-        ent_pages = _field("Invoice Pages (e.g. 1 or 13-14):", "Invoice Pages")
-
-        def _update():
-            row_data["Account No"] = ent_acc.get().strip()
-            row_data["Search Name"] = ent_name.get().strip()
-            row_data["Invoice No"] = ent_inv_no.get().strip()
-            d_raw = ent_date.get().strip()
+        def _update(values, dialog):
+            row_data["Account No"] = values["Account No"]
+            row_data["Search Name"] = values["Search Name"]
+            row_data["Invoice No"] = values["Invoice No"]
+            d_raw = values["Invoice Date"]
             row_data["Invoice Date"] = format_date_dmy(d_raw) if d_raw else ""
-            a_raw = ent_amt.get().strip()
+            a_raw = values["Invoice Amount"]
             a_cents = parse_amount_cents(a_raw)
             row_data["Invoice Amount"] = format_cents(a_cents) if a_cents is not None else a_raw
-            row_data["Source PDF Path"] = ent_pdf.get().strip()
+            row_data["Source PDF Path"] = values["Source PDF Path"]
             if row_data["Source PDF Path"]:
                 row_data["Source File"] = os.path.basename(row_data["Source PDF Path"])
-            row_data["Invoice Pages"] = ent_pages.get().strip()
+            row_data["Invoice Pages"] = values["Invoice Pages"]
             self.refresh_table()
             self._save_extracted_excel()
             dialog.destroy()
 
-        self._create_button(frame, "Save Changes", _update, bg=THEME["blue"], hover_bg=THEME["blue_hover"]).pack(fill="x", pady=(4, 0))
+        self._open_case_form_dialog(f"Edit Row #{idx + 1}", specs, "Save Changes", _update)
 
     def on_delete_selected(self):
         if self.is_running:
