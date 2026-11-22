@@ -15,6 +15,7 @@ venv.bak/
 Output/
 *Output*/
 extracted_invoices/
+.cpro_ocr_cache/
 extracted_cases.xlsx
 cpro_availability_report.xlsx
 *.xlsx

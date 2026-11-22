@@ -55,9 +55,16 @@ Law firms acting on behalf of banking institutions frequently process large scan
 - **Strict In-Memory Password Protection**: Passwords remain strictly in runtime RAM and are **never** written to disk.
 
 ### 🔍 Zero-Setup Scanned PDF & Multi-Invoice Extractor
-- **Windows Built-In OCR + Fallbacks**: Reads digital PDF text layers (`PyMuPDF` / `pypdf`) and automatically processes scanned PDFs locally via `pypdf` + `Pillow` + **Windows WinRT OCR** (`Windows.Media.Ocr`)—with `RapidOCR` fallback when installed.
+- **Windows Built-In OCR + Persistent Disk Cache**: Reads digital PDF text layers (`PyMuPDF` / `pypdf`) and automatically processes scanned PDFs locally via `pypdf` + `Pillow` + **Windows WinRT OCR** (`Windows.Media.Ocr`)—with `RapidOCR` fallback when installed. Caches extracted page OCR under `.cpro_ocr_cache/` (keyed by filename, size, and mtime) so repeat uploads load in `< 0.1s`.
+- **Background OCR Pipelining**: When multiple PDFs are queued (or added mid-run with **`＋ Queue More PDFs`**), Batch #1 starts in C-PRO immediately while remaining PDFs extract concurrently in the background.
 - **Automatic Page Classification & Grouping**: Skips C-PRO *Billing History* printout pages, handles rotated scans (`/Rotate`), and groups multi-page invoices cleanly.
 - **Multi-Signal Amount & Metadata Extraction**: Extracts `Invoice No`, `Invoice Date`, `Invoice Amount` (cross-checked via `RINGGIT MALAYSIA` words, `Sub Total + Service Tax`, and totals), `Account No`, `Alt Account No` (paired `&` accounts and credit card `c:` numbers), `Borrower Name`, and exact `Invoice Pages`.
+
+### ⚡ High-Efficiency Portal Automation & Zero-Touch Folder Workflow
+- **Pooled Persistent Browser Sessions**: Reuses authenticated Playwright browser contexts across consecutive PDF batches in a run without closing and re-logging in between PDFs (re-authenticating only if kicked out).
+- **Learned Account Affinity**: Orders enabled C-PRO logins by learned match history and 4-digit account prefix hits so matching branch logins run first.
+- **Tuned Grid & Restore Timings**: Faster `fast_restore` section transitions after `< BACK` and tighter DevExtreme XHR/stability polling reduce per-case overhead.
+- **Folder Watcher & Auto-Archive**: Optional toggles to watch `Scanned Invoice/` for new PDFs and automatically move completed PDFs (with 0 `CHECK ERROR`s) into `Complete CPRO Scan/`.
 
 ### 🌐 Automated Billing Verification & E-INVOICE Upload
 - **Multi-PDF Batch Queue & Sequential One-by-One Execution**:
@@ -84,8 +91,8 @@ Law firms acting on behalf of banking institutions frequently process large scan
 ### 📊 Per-PDF & Master Excel Output Management
 - **Separate Excel Files per PDF**:
   - **Per-PDF Extracted Cases**: `extracted_cases_<pdf_name>.xlsx` is saved immediately as each PDF is scanned/extracted.
-  - **Per-PDF Final C-PRO Report**: `cpro_availability_report_<pdf_name>.xlsx` (with `Summary_Report` and `All_Checks_Detail` worksheets for that specific PDF) is saved immediately when each PDF batch completes its C-PRO check.
-  - **Master Combined Queue & Report**: Also maintains `extracted_cases.xlsx` and `cpro_availability_report.xlsx` across all queued PDF batches.
+  - **Per-PDF Final C-PRO Report**: `cpro_availability_report_<pdf_name>.xlsx` (with **`Summary_Report`**, **`Action_Required`** for pending/mismatch/error rows, and **`All_Checks_Detail`** worksheets for that specific PDF) is saved immediately when each PDF batch completes its C-PRO check.
+  - **Master Combined Queue & Report**: Also maintains `extracted_cases.xlsx` and `cpro_availability_report.xlsx` (each with `Summary_Report`, `Action_Required`, and `All_Checks_Detail`) across all queued PDF batches.
 - **Lock-Resistant Fallback System**: Automatically saves timestamped fallbacks in writable system folders (`Script Directory` → `Desktop` → `Documents` → `AppData` → `Temp`) if Excel locks the target workbook.
 
 ---

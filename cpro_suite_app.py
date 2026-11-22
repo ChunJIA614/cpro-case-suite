@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import shutil
+import hashlib
 import datetime
 import threading
 import subprocess
@@ -215,6 +216,7 @@ else:
 EXTRACTED_EXCEL = os.path.join(OUTPUT_DIR, "extracted_cases.xlsx")
 REPORT_EXCEL = os.path.join(OUTPUT_DIR, "cpro_availability_report.xlsx")
 EXTRACTED_INVOICES_DIR = os.path.join(OUTPUT_DIR, "extracted_invoices")
+OCR_CACHE_DIR = os.path.join(OUTPUT_DIR, ".cpro_ocr_cache")
 
 
 # ==============================================================================
@@ -534,6 +536,53 @@ def extract_invoice_pdf_pages(source_pdf_path, page_numbers, dest_pdf_path):
 class PDFExtractorEngine:
     def __init__(self):
         self.ocr = None
+        self._mem_ocr_cache = {}
+
+    @staticmethod
+    def _get_pdf_cache_key(pdf_path):
+        abs_path = os.path.abspath(pdf_path)
+        st = os.stat(abs_path)
+        sig = f"{os.path.basename(abs_path)}|{st.st_size}|{int(st.st_mtime_ns)}"
+        return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:24]
+
+    def _load_cached_pages(self, pdf_path):
+        try:
+            key = self._get_pdf_cache_key(pdf_path)
+        except OSError:
+            return None
+        if key in self._mem_ocr_cache:
+            return json.loads(json.dumps(self._mem_ocr_cache[key]))
+        cache_path = os.path.join(OUTPUT_DIR, ".cpro_ocr_cache", f"{key}.json")
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list) and data:
+                    self._mem_ocr_cache[key] = data
+                    return json.loads(json.dumps(data))
+            except Exception:
+                pass
+        return None
+
+    def _save_cached_pages(self, pdf_path, pages_out):
+        if not pages_out:
+            return
+        try:
+            key = self._get_pdf_cache_key(pdf_path)
+        except OSError:
+            return
+        snapshot = json.loads(json.dumps(pages_out))
+        self._mem_ocr_cache[key] = snapshot
+        cache_dir = os.path.join(OUTPUT_DIR, ".cpro_ocr_cache")
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"{key}.json")
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False)
+            os.replace(tmp_path, cache_path)
+        except Exception:
+            pass
 
     @staticmethod
     def _clean_borrower_short_name(full_name):
@@ -733,6 +782,12 @@ class PDFExtractorEngine:
         Return list of page dicts:
         {'page_num': int, 'width': int, 'height': int, 'text': str, 'lines': [{'text': str, 'words': [...]}]}
         """
+        cached = self._load_cached_pages(pdf_path)
+        if cached is not None:
+            if progress_cb:
+                progress_cb(f"  [OCR CACHE] Loaded cached scan for {os.path.basename(pdf_path)} ({len(cached)} pages).")
+            return cached
+
         pages_out = []
 
         # 1. Try fast digital text layer first (PyMuPDF or pypdf)
@@ -752,6 +807,7 @@ class PDFExtractorEngine:
             for pno, txt in digital_texts:
                 lines = [{"text": ln, "words": []} for ln in txt.splitlines() if ln.strip()]
                 pages_out.append({"page_num": pno, "width": 0, "height": 0, "text": txt, "lines": lines})
+            self._save_cached_pages(pdf_path, pages_out)
             return pages_out
 
         # 2. Scanned PDF: prefer fast zero-dependency Windows WinRT OCR
@@ -762,6 +818,7 @@ class PDFExtractorEngine:
                     lines = wp.get("lines", [])
                     wp["text"] = "\n".join(ln.get("text", "") for ln in lines)
                     pages_out.append(wp)
+                self._save_cached_pages(pdf_path, pages_out)
                 return pages_out
 
         # 3. Fallback to PyMuPDF + RapidOCR (for non-Windows or if WinRT unavailable)
@@ -785,6 +842,7 @@ class PDFExtractorEngine:
             lines = [{"text": ln, "words": []} for ln in text.splitlines() if ln.strip()]
             pages_out.append({"page_num": idx + 1, "width": 0, "height": 0, "text": text, "lines": lines})
         doc.close()
+        self._save_cached_pages(pdf_path, pages_out)
         return pages_out
 
     @staticmethod
@@ -1184,6 +1242,8 @@ class CProSuiteApp:
         self.search_mode = tk.StringVar(value="ACCOUNT_THEN_NAME")
         self.verify_and_upload = tk.BooleanVar(value=True)
         self.auto_run_after_upload = tk.BooleanVar(value=False)
+        self.watch_scanned_folder = tk.BooleanVar(value=False)
+        self.auto_archive_completed_pdfs = tk.BooleanVar(value=False)
         self.show_browser = tk.BooleanVar(value=True)
 
         self.pdf_batch_filter_var = tk.StringVar(value="All Queued PDFs (0 files · 0 records)")
@@ -1194,12 +1254,19 @@ class CProSuiteApp:
         self.report_excel_paths = {}
         self._queued_pdf_paths = []
         self._pdf_queue_lock = threading.Lock()
+        self._cases_lock = threading.Lock()
+        self._bg_extract_thread = None
+        self._bg_extract_active = False
+        self._watched_seen_pdfs = set()
+        self.account_hit_counts = {}
+        self.account_prefix_affinity = {}
 
         self._configure_styles()
         self._build_layout()
         self._load_saved_accounts()
         self.log(f"Output folder: {OUTPUT_DIR}")
         self._auto_load_existing_excel()
+        self._safe_ui_after(3000, self._poll_watched_folder)
 
     def _configure_styles(self):
         style = ttk.Style()
@@ -1384,6 +1451,35 @@ class CProSuiteApp:
         tk.Label(
             card2,
             text="Processes queued PDFs sequentially one by one and saves separate Excel files for each PDF.",
+            font=("Segoe UI", 7),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=330,
+            justify="left",
+        ).pack(anchor="w", padx=(20, 0), pady=(0, 4))
+        tk.Checkbutton(
+            card2,
+            text="Watch 'Scanned Invoice' Folder",
+            variable=self.watch_scanned_folder,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            activebackground=THEME["card"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(2, 1))
+        tk.Checkbutton(
+            card2,
+            text="Auto-Move Completed PDFs to 'Complete CPRO Scan'",
+            variable=self.auto_archive_completed_pdfs,
+            bg=THEME["card"],
+            fg=THEME["text"],
+            activebackground=THEME["card"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(fill="x", pady=(1, 2))
+        tk.Label(
+            card2,
+            text="Automatically detects new PDFs dropped into 'Scanned Invoice' and archives clean completed PDFs.",
             font=("Segoe UI", 7),
             bg=THEME["card"],
             fg=THEME["subtext"],
@@ -1670,6 +1766,15 @@ class CProSuiteApp:
         self.log_text = tk.Text(log_card, height=6, bg="#F9F9FB", fg=THEME["text"], relief="flat", bd=6, font=("Consolas", 9), state="disabled")
         self.log_text.pack(fill="x")
 
+    def _safe_ui_after(self, delay_ms, fn):
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        try:
+            root.after(delay_ms, fn)
+        except (RuntimeError, tk.TclError):
+            pass
+
     def log(self, message):
         timestamp = time.strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}\n"
@@ -1680,10 +1785,10 @@ class CProSuiteApp:
             self.log_text.see("end")
             self.log_text.config(state="disabled")
 
-        self.root.after(0, _append)
+        self._safe_ui_after(0, _append)
 
     def set_status(self, text, bg="#E8E8ED", fg=THEME["text"]):
-        self.root.after(0, lambda: self.status_badge.config(text=f"●  {text}", bg=bg, fg=fg))
+        self._safe_ui_after(0, lambda: self.status_badge.config(text=f"●  {text}", bg=bg, fg=fg))
 
     def set_progress(self, current, total):
         pct = int((current / total) * 100) if total > 0 else 0
@@ -1692,7 +1797,7 @@ class CProSuiteApp:
             self.progress["value"] = pct
             self.lbl_progress.config(text=f"{pct}% ({current}/{total})")
 
-        self.root.after(0, _upd)
+        self._safe_ui_after(0, _upd)
 
     def _set_controls_running(self, running, allow_stop=False):
         state = "disabled" if running else "normal"
@@ -1719,7 +1824,7 @@ class CProSuiteApp:
                 btn.config(state=state)
             self.btn_stop.config(state=stop_state)
 
-        self.root.after(0, _apply)
+        self._safe_ui_after(0, _apply)
 
     @staticmethod
     def _row_source_key(row):
@@ -2013,7 +2118,7 @@ class CProSuiteApp:
             elif y_pos > 0.0:
                 self.tree.yview_moveto(y_pos)
 
-        self.root.after(0, _rebuild)
+        self._safe_ui_after(0, _rebuild)
 
     @staticmethod
     def _normalize_imported_row(rec, fallback_source=""):
@@ -2220,6 +2325,19 @@ class CProSuiteApp:
             for row in rows_subset
         ]
         df_summary = pd.DataFrame(summary_rows)
+        action_rows = [
+            row for row in summary_rows
+            if row.get("Availability Status", "") not in ("COMPLETE", "AVAILABLE")
+        ]
+        if action_rows:
+            df_action = pd.DataFrame(action_rows)
+        elif not df_summary.empty:
+            df_action = df_summary.iloc[0:0].copy()
+        else:
+            df_action = pd.DataFrame(columns=[
+                "Source File", "Invoice No", "Account No", "Search Name",
+                "Invoice Date", "Invoice Amount", "Availability Status", "C-PRO Row Details",
+            ])
         if detailed_subset:
             df_detailed = pd.DataFrame(detailed_subset)
         else:
@@ -2232,10 +2350,11 @@ class CProSuiteApp:
         def _write_report(path):
             with pd.ExcelWriter(path, engine="openpyxl") as writer:
                 df_summary.to_excel(writer, index=False, sheet_name="Summary_Report")
+                df_action.to_excel(writer, index=False, sheet_name="Action_Required")
                 df_detailed.to_excel(writer, index=False, sheet_name="All_Checks_Detail")
                 for sheet in writer.sheets.values():
                     for col in sheet.columns:
-                        max_len = max(len(str(cell.value or "")) for cell in col) + 4
+                        max_len = max((len(str(cell.value or "")) for cell in col), default=10) + 4
                         sheet.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
 
         return self._write_with_fallback(preferred_path, _write_report, description)
@@ -2293,55 +2412,63 @@ class CProSuiteApp:
             self.log(f"  [!] No Invoices / Account Numbers found in {fname}")
             return []
 
-        # Replace existing rows from the exact same PDF filename if re-uploaded, keeping all other PDFs intact
-        self.cases_data = [r for r in self.cases_data if self._row_source_key(r) != fname]
-        for case in extracted_cases:
-            self.cases_data.append(case)
-            inv_info = f"{case.get('Invoice No') or '-'} | {case.get('Invoice Date') or '-'} | RM {case.get('Invoice Amount') or '-'}"
-            self.log(f"  -> p.{case.get('Invoice Pages') or '?'} | {inv_info} | {case['Account No']} | {case['Search Name']}")
+        with self._cases_lock:
+            if not self.is_running:
+                self.cases_data = [r for r in self.cases_data if self._row_source_key(r) != fname]
+            for case in extracted_cases:
+                self.cases_data.append(case)
+                inv_info = f"{case.get('Invoice No') or '-'} | {case.get('Invoice Date') or '-'} | RM {case.get('Invoice Amount') or '-'}"
+                self.log(f"  -> p.{case.get('Invoice Pages') or '?'} | {inv_info} | {case['Account No']} | {case['Search Name']}")
+            self.pdf_batch_status[fname] = "Queued"
 
-        self.pdf_batch_status[fname] = "Queued"
         saved_per_pdf = self._save_extracted_excel(target_source_file=fname)
         if saved_per_pdf:
             self.log(f"  [EXCEL] Saved {len(extracted_cases)} extracted record(s) for '{fname}' -> '{saved_per_pdf}'")
         self.refresh_table()
         return extracted_cases
 
-    def _drain_queued_pdfs_inline(self):
-        while not self.stop_requested:
-            with self._pdf_queue_lock:
-                if not self._queued_pdf_paths:
-                    break
-                next_pdf = self._queued_pdf_paths.pop(0)
-            fname = os.path.basename(next_pdf)
-            try:
-                self.set_status(f"Extracting queued PDF: {fname}...", bg="#EBF5FF", fg=THEME["blue"])
-                self._extract_and_store_single_pdf(next_pdf)
-            except Exception as e:
-                self.log(f"  [ERROR] Failed to extract queued PDF {fname}: {e}")
+    def _ensure_background_pdf_extractor(self):
+        with self._pdf_queue_lock:
+            if self._bg_extract_active or not self._queued_pdf_paths:
+                return
+            self._bg_extract_active = True
 
-    def on_upload_pdfs(self):
-        initial_dir = os.path.join(OUTPUT_DIR, "Scanned Invoice")
-        if not os.path.isdir(initial_dir):
-            initial_dir = OUTPUT_DIR
-        pdf_files = filedialog.askopenfilenames(
-            parent=self.root,
-            title="Select Invoice / Case PDF Files (Multiple PDFs Supported)",
-            initialdir=initial_dir,
-            filetypes=[("PDF Files", "*.pdf")],
-        )
+        def _bg_worker():
+            try:
+                while not self.stop_requested:
+                    with self._pdf_queue_lock:
+                        if not self._queued_pdf_paths:
+                            break
+                        next_pdf = self._queued_pdf_paths.pop(0)
+                    fname = os.path.basename(next_pdf)
+                    try:
+                        self.log(f"[BG-OCR] Background extracting queued PDF: {fname}...")
+                        self._extract_and_store_single_pdf(next_pdf)
+                    except Exception as e:
+                        self.log(f"  [ERROR] Background OCR failed for {fname}: {e}")
+            finally:
+                with self._pdf_queue_lock:
+                    self._bg_extract_active = False
+
+        self._bg_extract_thread = threading.Thread(target=_bg_worker, daemon=True)
+        self._bg_extract_thread.start()
+
+    def _enqueue_pdf_paths_for_processing(self, pdf_files):
         if not pdf_files:
             return
-
-        # If automation or extraction is already running, queue the selected PDFs to run automatically after current batch
+        # If automation or extraction is already running, queue and background-OCR immediately
         if self.is_running:
+            added = []
             with self._pdf_queue_lock:
                 for p in pdf_files:
                     if p not in self._queued_pdf_paths:
                         self._queued_pdf_paths.append(p)
-            names = ", ".join(os.path.basename(p) for p in pdf_files)
-            self.log(f"[QUEUE] Queued {len(pdf_files)} additional PDF(s) ({names}) — will extract & run automatically in sequence.")
-            self.root.after(0, self._update_pdf_batch_selector)
+                        added.append(p)
+            if added:
+                names = ", ".join(os.path.basename(p) for p in added)
+                self.log(f"[QUEUE] Queued {len(added)} additional PDF(s) ({names}) — background-extracting & running next in sequence.")
+                self._ensure_background_pdf_extractor()
+                self._safe_ui_after(0, self._update_pdf_batch_selector)
             return
 
         # Uncheck already-finished rows from earlier runs so a subsequent run processes only pending/new PDF batches
@@ -2357,6 +2484,8 @@ class CProSuiteApp:
             for p in pdf_files:
                 if p not in self._queued_pdf_paths:
                     self._queued_pdf_paths.append(p)
+
+        pipeline_auto_run = bool(self.auto_run_after_upload.get())
 
         def _worker():
             extracted_files_count = 0
@@ -2377,20 +2506,118 @@ class CProSuiteApp:
                         self.log(f"  [ERROR] Failed to extract {fname}: {e}")
                     self.set_progress(extracted_files_count, total_seen)
 
-                num_batches = len(self._get_ordered_source_files())
-                self.log(
-                    f"Extraction complete: {extracted_files_count} PDF file(s) scanned into individual Excel files "
-                    f"({num_batches} total PDF batch(es) in queue, {len(self.cases_data)} total row(s))."
-                )
+                    # When Auto-Run is enabled, hand off to C-PRO as soon as first non-empty batch is ready;
+                    # remaining queued PDFs will extract in parallel in the background while C-PRO runs!
+                    if pipeline_auto_run and self.cases_data and remaining > 0:
+                        self.log(f"[PIPELINE] First batch ready; {remaining} remaining PDF(s) will OCR in background while C-PRO starts!")
+                        break
+
+                if not (pipeline_auto_run and self._queued_pdf_paths):
+                    num_batches = len(self._get_ordered_source_files())
+                    self.log(
+                        f"Extraction complete: {extracted_files_count} PDF file(s) scanned into individual Excel files "
+                        f"({num_batches} total PDF batch(es) in queue, {len(self.cases_data)} total row(s))."
+                    )
                 self.set_status("Ready", bg="#E8E8ED", fg=THEME["text"])
             finally:
                 self.is_running = False
                 self._set_controls_running(False)
                 if self.auto_run_after_upload.get() and not self.stop_requested and self.cases_data:
                     self.log("[AUTO-RUN] Auto-starting sequential C-PRO check for queued PDF batch(es)...")
-                    self.root.after(150, self.on_start_cpro_check)
+                    self._safe_ui_after(150, self.on_start_cpro_check)
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _scan_watched_folder_once(self):
+        watch_dir = os.path.join(OUTPUT_DIR, "Scanned Invoice")
+        if not os.path.isdir(watch_dir):
+            return []
+        existing_sources = {self._row_source_key(r) for r in self.cases_data}
+        with self._pdf_queue_lock:
+            queued_basenames = {os.path.basename(p) for p in self._queued_pdf_paths}
+        new_paths = []
+        for entry in sorted(os.listdir(watch_dir)):
+            if not entry.lower().endswith(".pdf"):
+                continue
+            fpath = os.path.join(watch_dir, entry)
+            if not os.path.isfile(fpath) or entry in existing_sources or entry in queued_basenames:
+                continue
+            try:
+                st = os.stat(fpath)
+                if st.st_size <= 0:
+                    continue
+                with open(fpath, "rb"):
+                    pass
+                sig = (os.path.normcase(os.path.abspath(fpath)), st.st_size, int(st.st_mtime_ns))
+            except OSError:
+                continue
+            if sig in self._watched_seen_pdfs:
+                continue
+            self._watched_seen_pdfs.add(sig)
+            new_paths.append(fpath)
+
+        if new_paths:
+            names = ", ".join(os.path.basename(p) for p in new_paths)
+            self.log(f"[WATCHER] Detected {len(new_paths)} new PDF(s) in Scanned Invoice: {names}")
+            self._enqueue_pdf_paths_for_processing(new_paths)
+        return new_paths
+
+    def _poll_watched_folder(self):
+        try:
+            if self.watch_scanned_folder.get() and not self.stop_requested:
+                self._scan_watched_folder_once()
+        except Exception as e:
+            self.log(f"[WATCHER] Folder poll error: {e}")
+        finally:
+            self._safe_ui_after(4000, self._poll_watched_folder)
+
+    def _archive_completed_pdf_if_enabled(self, source_file, batch_indices):
+        if not self.auto_archive_completed_pdfs.get() or not batch_indices:
+            return None
+        if any(self.cases_data[i].get("Availability Status") == "CHECK ERROR" for i in batch_indices):
+            return None
+        src_pdf = ""
+        for i in batch_indices:
+            cand = (self.cases_data[i].get("Source PDF Path") or "").strip()
+            if cand and os.path.isfile(cand):
+                src_pdf = cand
+                break
+        if not src_pdf:
+            return None
+        abs_src = os.path.abspath(src_pdf)
+        archive_dir = os.path.join(OUTPUT_DIR, "Complete CPRO Scan")
+        if os.path.normcase(os.path.dirname(abs_src)) == os.path.normcase(os.path.abspath(archive_dir)):
+            return abs_src
+        # Only auto-move files originating from Scanned Invoice (or explicitly uploaded outside Complete CPRO Scan)
+        os.makedirs(archive_dir, exist_ok=True)
+        dest = os.path.join(archive_dir, os.path.basename(abs_src))
+        if os.path.exists(dest):
+            stem, ext = os.path.splitext(os.path.basename(abs_src))
+            dest = os.path.join(archive_dir, f"{stem}_{time.strftime('%Y%m%d_%H%M%S')}{ext}")
+        try:
+            shutil.move(abs_src, dest)
+            for r in self.cases_data:
+                if self._row_source_key(r) == source_file:
+                    r["Source PDF Path"] = dest
+            self.log(f"[ARCHIVE] Moved completed PDF '{source_file}' -> '{dest}'")
+            return dest
+        except Exception as e:
+            self.log(f"[ARCHIVE] Could not move '{source_file}' to Complete CPRO Scan: {e}")
+            return None
+
+    def on_upload_pdfs(self):
+        initial_dir = os.path.join(OUTPUT_DIR, "Scanned Invoice")
+        if not os.path.isdir(initial_dir):
+            initial_dir = OUTPUT_DIR
+        pdf_files = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Select Invoice / Case PDF Files (Multiple PDFs Supported)",
+            initialdir=initial_dir,
+            filetypes=[("PDF Files", "*.pdf")],
+        )
+        if not pdf_files:
+            return
+        self._enqueue_pdf_paths_for_processing(pdf_files)
 
     def on_import_excel(self):
         if self.is_running:
@@ -2941,7 +3168,7 @@ class CProSuiteApp:
         except Exception:
             return
 
-    def _wait_for_section_table(self, page, section, timeout_ms=45000, action=None):
+    def _wait_for_section_table(self, page, section, timeout_ms=45000, action=None, fast_restore=False):
         started = time.monotonic()
         deadline = started + timeout_ms / 1000.0
         last_signature = None
@@ -2999,13 +3226,15 @@ class CProSuiteApp:
 
                 elapsed = time.monotonic() - started
                 stable_for = time.monotonic() - (stable_since or time.monotonic())
-                network_quiet = not pending and (time.monotonic() - last_network) >= 1.0
-                min_wait = 1.5 if saw_xhr else 4.0
+                quiet_window = 0.45 if fast_restore else 0.65
+                network_quiet = not pending and (time.monotonic() - last_network) >= quiet_window
+                min_wait = (0.45 if saw_xhr else 0.75) if fast_restore else (0.75 if saw_xhr else 1.35)
+                req_stable = 0.40 if fast_restore else 0.70
 
-                if table_ready and not loading and elapsed >= min_wait and stable_for >= 1.25 and (network_quiet if saw_xhr else True):
+                if table_ready and not loading and elapsed >= min_wait and stable_for >= req_stable and (network_quiet if saw_xhr else True):
                     self.log(f"[WAIT] {section} table ready after {elapsed:.1f}s")
                     return
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(150)
 
             raise GridLoadTimeoutError(f"Timed out waiting for {section} table.")
         finally:
@@ -3015,7 +3244,7 @@ class CProSuiteApp:
                 except Exception:
                     pass
 
-    def _switch_section_and_wait(self, page, section):
+    def _switch_section_and_wait(self, page, section, fast_restore=False):
         self._dismiss_session_timeout_warning(page)
         tab = next(self._section_tab_candidates(page, section), None)
         if tab is None:
@@ -3032,7 +3261,7 @@ class CProSuiteApp:
                 pass
             tab.click(timeout=8000)
 
-        self._wait_for_section_table(page, section, timeout_ms=45000, action=_click_tab)
+        self._wait_for_section_table(page, section, timeout_ms=45000, action=_click_tab, fast_restore=fast_restore)
 
     def _prompt_for_correct_password(self, acc, reason):
         result = {"password": None}
@@ -3049,7 +3278,7 @@ class CProSuiteApp:
             finally:
                 ready.set()
 
-        self.root.after(0, ask)
+        self._safe_ui_after(0, ask)
         while not ready.wait(0.2):
             if self.stop_requested:
                 return None
@@ -3057,7 +3286,7 @@ class CProSuiteApp:
         if password:
             acc["password"] = password
             if acc.get("password_var") is not None:
-                self.root.after(0, lambda v=acc["password_var"], p=password: v.set(p))
+                self._safe_ui_after(0, lambda v=acc["password_var"], p=password: v.set(p))
         return password or None
 
     @staticmethod
@@ -3431,17 +3660,17 @@ class CProSuiteApp:
                     loading_seen = True
 
                 xhr_seen = bool(seen_xhr)
-                network_quiet = not pending_xhr and (now - last_network_activity[0]) >= 0.9
+                network_quiet = not pending_xhr and (now - last_network_activity[0]) >= 0.55
                 changed = signature != before_signature
 
                 if xhr_seen:
-                    min_elapsed = 1.0
+                    min_elapsed = 0.65
                     network_ready = network_quiet
-                    required_stable_samples = 4
+                    required_stable_samples = 3
                 else:
-                    min_elapsed = 1.5 if changed else 3.5
+                    min_elapsed = 0.75 if changed else 1.75
                     network_ready = True
-                    required_stable_samples = 5
+                    required_stable_samples = 3 if changed else 4
 
                 if elapsed >= min_elapsed and stable_samples >= required_stable_samples and not loading and network_ready:
                     if require_activity and not (xhr_seen or grid_change_seen or loading_seen):
@@ -3450,7 +3679,7 @@ class CProSuiteApp:
                             return elapsed
                         raise GridSearchError(f"No XHR/loading/row change observed after submitting {description}.")
                     return elapsed
-                page.wait_for_timeout(250)
+                page.wait_for_timeout(150)
 
             raise GridLoadTimeoutError(f"C-PRO grid did not finish '{description}' within {timeout_ms // 1000}s.")
         finally:
@@ -4411,7 +4640,7 @@ class CProSuiteApp:
                 return
 
         try:
-            self._switch_section_and_wait(page, section)
+            self._switch_section_and_wait(page, section, fast_restore=True)
         except InvalidCredentialsError as e:
             if self._is_fatal_auth_error(e):
                 raise
@@ -4598,7 +4827,27 @@ class CProSuiteApp:
                 case["Upload Status"] = "-"
                 case["C-PRO Row Details"] = "-"
 
-    def _run_check_pass(self, browser, active_accounts, active_sections, pass_indices, found_tracker, detailed_log, mode, verify_mode, round_label):
+    def _order_accounts_by_affinity(self, active_accounts, pass_indices):
+        """Order C-PRO accounts by learned hit affinity for the current batch (ties preserve original order)."""
+        if len(active_accounts) <= 1 or not pass_indices:
+            return list(active_accounts)
+        hit_counts = getattr(self, "account_hit_counts", {})
+        prefix_affinity = getattr(self, "account_prefix_affinity", {})
+        scored = []
+        for orig_idx, acc in enumerate(active_accounts):
+            uname = acc["username"]
+            prefix_score = 0
+            for idx in pass_indices:
+                acc_no = (self.cases_data[idx].get("Account No") or "").strip()
+                if len(acc_no) >= 4 and prefix_affinity.get(acc_no[:4]) == uname:
+                    prefix_score += 10
+            hist_score = hit_counts.get(uname, 0)
+            scored.append((-(prefix_score + hist_score), orig_idx, acc))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in scored]
+
+    def _run_check_pass(self, browser, active_accounts, active_sections, pass_indices, found_tracker, detailed_log, mode, verify_mode, round_label, session_pool=None):
+        ordered_accounts = self._order_accounts_by_affinity(active_accounts, pass_indices)
         checked_pairs = {idx: {} for idx in pass_indices}
         error_reasons = {idx: [] for idx in pass_indices}
         for idx in pass_indices:
@@ -4613,7 +4862,7 @@ class CProSuiteApp:
             case["C-PRO Row Details"] = "-"
         self.refresh_table()
 
-        total_steps = len(active_accounts) * len(active_sections) * len(pass_indices)
+        total_steps = len(ordered_accounts) * len(active_sections) * len(pass_indices)
         completed_steps = 0
         self.set_progress(0, total_steps)
 
@@ -4647,7 +4896,7 @@ class CProSuiteApp:
                             "Round": round_label,
                         })
 
-        for acc_idx, acc in enumerate(active_accounts):
+        for acc_idx, acc in enumerate(ordered_accounts):
             if self.stop_requested:
                 break
             if _all_done():
@@ -4658,14 +4907,43 @@ class CProSuiteApp:
             username = acc["username"]
             self.log(f"=== [{round_label}] Starting Account: {username} ===")
 
-            context = browser.new_context()
-            page = context.new_page()
-            self._install_session_timeout_handler(page)
+            reused_session = False
+            context = None
+            page = None
+            if session_pool is not None and username in session_pool:
+                sess = session_pool[username]
+                try:
+                    if sess.get("page") is not None and not sess["page"].is_closed():
+                        context = sess["context"]
+                        page = sess["page"]
+                        reused_session = True
+                except Exception:
+                    context = None
+                    page = None
+
+            if not reused_session:
+                context = browser.new_context()
+                page = context.new_page()
+                self._install_session_timeout_handler(page)
+                if session_pool is not None:
+                    session_pool[username] = {"context": context, "page": page}
+
             current_sec_idx = 0
             current_section = active_sections[0] if active_sections else "(not selected)"
 
             try:
-                self._login_and_restore_section(page, acc, section=None)
+                if reused_session:
+                    if (
+                        self._is_kicked_or_unauthorized(page)
+                        or self._is_on_case_details(page)
+                        or "/case-listing" not in page.url.lower()
+                    ):
+                        self.log(f"[SESSION] Pooled session for {username} needs restore; re-authenticating...")
+                        self._login_and_restore_section(page, acc, section=None)
+                    else:
+                        self.log(f"[SESSION] Reusing active authenticated session for {username}.")
+                else:
+                    self._login_and_restore_section(page, acc, section=None)
 
                 for sec_idx, section in enumerate(active_sections):
                     if self.stop_requested:
@@ -4830,6 +5108,10 @@ class CProSuiteApp:
                                 found_tracker[idx]["accounts"].append(username)
                                 found_tracker[idx]["sections"].append(f"{username}: {section}")
                                 found_tracker[idx]["details"].extend(m[1] for m in new_rows)
+                                if hasattr(self, "account_hit_counts"):
+                                    self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
+                                if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
+                                    self.account_prefix_affinity[acc_no[:4]] = username
 
                                 case["Availability Status"] = "AVAILABLE"
                                 case["Found In Account(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["accounts"]))
@@ -4976,6 +5258,10 @@ class CProSuiteApp:
                                 found_tracker[idx]["accounts"].append(username)
                                 found_tracker[idx]["sections"].append(f"{username}: {section}")
                                 found_tracker[idx]["details"].append(wf["matched_row_detail"])
+                                if hasattr(self, "account_hit_counts"):
+                                    self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
+                                if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
+                                    self.account_prefix_affinity[acc_no[:4]] = username
 
                                 case["Availability Status"] = "COMPLETE" if outcome == "COMPLETE" else "BILLING MATCHED (No PDF)"
                                 case["Found In Account(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["accounts"]))
@@ -5023,7 +5309,7 @@ class CProSuiteApp:
                             if found_any_row:
                                 self._resolve_case_after_clean_pair(
                                     case, checked_pairs[idx], error_reasons[idx],
-                                    acc_idx, username, section, active_accounts, active_sections,
+                                    acc_idx, username, section, ordered_accounts, active_sections,
                                     pair_state="BILLING_MISMATCH",
                                     mismatch_note=last_mismatch_detail,
                                 )
@@ -5031,7 +5317,7 @@ class CProSuiteApp:
                                 self.log(f"  ✗ NOT FOUND: {search_name or acc_no or '(no search value)'} in {username} -> {section}")
                                 self._resolve_case_after_clean_pair(
                                     case, checked_pairs[idx], error_reasons[idx],
-                                    acc_idx, username, section, active_accounts, active_sections,
+                                    acc_idx, username, section, ordered_accounts, active_sections,
                                     pair_state="NOT_FOUND",
                                 )
                                 detailed_log.append({
@@ -5064,7 +5350,7 @@ class CProSuiteApp:
                             pending_case["C-PRO Row Details"] = str(e)
                     self.refresh_table()
                     self.log(f"[AUTH STOP] {e} Automation paused to protect account.")
-                    self.root.after(0, lambda msg=str(e): messagebox.showwarning("C-PRO Login Stopped", msg + "\n\nCorrect the password in the left panel, then restart.", parent=self.root))
+                    self._safe_ui_after(0, lambda msg=str(e): messagebox.showwarning("C-PRO Login Stopped", msg + "\n\nCorrect the password in the left panel, then restart.", parent=self.root))
                     self.stop_requested = True
                 else:
                     _mark_sections_error(acc_idx, username, active_sections[current_sec_idx:], str(e))
@@ -5085,32 +5371,47 @@ class CProSuiteApp:
                 self.log(f"[ERROR] Account {username} encountered an error: {e}")
                 self.refresh_table()
             finally:
-                try:
-                    context.close()
-                except Exception:
-                    pass
+                if session_pool is None:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
-    def _next_unprocessed_pdf_batch(self, processed_row_indices):
+    def _next_unprocessed_pdf_batch(self, processed_row_ids):
         """Return (source_file, batch_row_indices) for the next queued PDF batch that has selected unprocessed rows."""
         target_source = None
         batch_indices = []
-        for idx, row in enumerate(self.cases_data):
-            if idx in processed_row_indices:
-                continue
-            if not row.get("_checked", True):
-                continue
-            src = self._row_source_key(row)
-            if target_source is None:
-                target_source = src
-            if src == target_source:
-                batch_indices.append(idx)
+        lock = getattr(self, "_cases_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            for idx, row in enumerate(self.cases_data):
+                if id(row) in processed_row_ids or idx in processed_row_ids:
+                    continue
+                if not row.get("_checked", True):
+                    continue
+                src = self._row_source_key(row)
+                if target_source is None:
+                    target_source = src
+                if src == target_source:
+                    batch_indices.append(idx)
+        finally:
+            if lock is not None:
+                lock.release()
         return target_source, batch_indices
 
-    def _count_remaining_pdf_batches(self, processed_row_indices):
+    def _count_remaining_pdf_batches(self, processed_row_ids):
         rem_sources = set()
-        for idx, row in enumerate(self.cases_data):
-            if idx not in processed_row_indices and row.get("_checked", True):
-                rem_sources.add(self._row_source_key(row))
+        lock = getattr(self, "_cases_lock", None)
+        if lock is not None:
+            lock.acquire()
+        try:
+            for idx, row in enumerate(self.cases_data):
+                if id(row) not in processed_row_ids and idx not in processed_row_ids and row.get("_checked", True):
+                    rem_sources.add(self._row_source_key(row))
+        finally:
+            if lock is not None:
+                lock.release()
         with self._pdf_queue_lock:
             queued_files = len(self._queued_pdf_paths)
         return len(rem_sources) + queued_files
@@ -5119,9 +5420,10 @@ class CProSuiteApp:
         found_tracker = {}
         all_detailed_log = []
         recovery_resolved = False
-        processed_row_indices = set()
+        processed_row_ids = set()
         batch_reports = []
         all_processed_indices = []
+        session_pool = {}
 
         # Mark only the initial target_indices as checked for the start of this run; any newly queued PDFs added mid-run have _checked=True
         target_set = set(target_indices)
@@ -5130,23 +5432,28 @@ class CProSuiteApp:
 
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=headless, slow_mo=60)
+                browser = p.chromium.launch(headless=headless, slow_mo=20)
                 try:
                     batch_num = 0
                     while not self.stop_requested:
-                        # Extract any newly queued PDFs that were added while running
-                        self._drain_queued_pdfs_inline()
+                        # Start background OCR for any remaining/newly queued PDFs while C-PRO runs!
+                        self._ensure_background_pdf_extractor()
 
-                        source_file, batch_indices = self._next_unprocessed_pdf_batch(processed_row_indices)
+                        source_file, batch_indices = self._next_unprocessed_pdf_batch(processed_row_ids)
                         if not batch_indices:
+                            with self._pdf_queue_lock:
+                                bg_pending = self._bg_extract_active or bool(self._queued_pdf_paths)
+                            if bg_pending and not self.stop_requested:
+                                time.sleep(0.2)
+                                continue
                             break
 
-                        remaining_including_current = self._count_remaining_pdf_batches(processed_row_indices)
+                        remaining_including_current = self._count_remaining_pdf_batches(processed_row_ids)
                         batch_num += 1
                         total_batches_est = (batch_num - 1) + remaining_including_current
 
                         self.pdf_batch_status[source_file] = "Running"
-                        self.root.after(0, self._update_pdf_batch_selector)
+                        self._safe_ui_after(0, self._update_pdf_batch_selector)
                         self.log(
                             f"===================================================================="
                         )
@@ -5173,6 +5480,7 @@ class CProSuiteApp:
                             mode=mode,
                             verify_mode=verify_mode,
                             round_label=f"{source_file} - Initial",
+                            session_pool=session_pool,
                         )
 
                         initial_errors = sum(
@@ -5209,6 +5517,7 @@ class CProSuiteApp:
                                 mode=mode,
                                 verify_mode=verify_mode,
                                 round_label=f"{source_file} - Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}",
+                                session_pool=session_pool,
                             )
                         else:
                             if initial_errors > 0 and not any(
@@ -5216,7 +5525,8 @@ class CProSuiteApp:
                             ):
                                 recovery_resolved = True
 
-                        processed_row_indices.update(batch_indices)
+                        for b_idx in batch_indices:
+                            processed_row_ids.add(id(self.cases_data[b_idx]))
                         all_processed_indices.extend(batch_indices)
                         all_detailed_log.extend(batch_detailed_log)
 
@@ -5241,13 +5551,21 @@ class CProSuiteApp:
                             1 for i in batch_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE")
                         )
                         self.pdf_batch_status[source_file] = "Has Errors" if batch_err_cnt else "Completed"
-                        self.root.after(0, self._update_pdf_batch_selector)
+                        self._archive_completed_pdf_if_enabled(source_file, batch_indices)
+                        self._safe_ui_after(0, self._update_pdf_batch_selector)
                         batch_reports.append((source_file, len(batch_indices), batch_ok_cnt, batch_err_cnt, per_pdf_report_path))
                         self.log(
                             f">>> [PDF BATCH {batch_num}/{total_batches_est} DONE] {source_file}: "
                             f"{batch_ok_cnt}/{len(batch_indices)} complete -> Report saved to '{per_pdf_report_path}' <<<"
                         )
                 finally:
+                    for sess in session_pool.values():
+                        try:
+                            if sess.get("context") is not None:
+                                sess["context"].close()
+                        except Exception:
+                            pass
+                    session_pool.clear()
                     browser.close()
 
             # Also save master combined report across all rows
@@ -5262,7 +5580,7 @@ class CProSuiteApp:
             self.log(f"All queued PDF batches finished! Master report saved to '{master_report_path}'.")
 
             open_dir = os.path.abspath(os.path.dirname(self.last_report_path or master_report_path))
-            self.root.after(0, lambda d=open_dir: self._open_folder(d))
+            self._safe_ui_after(0, lambda d=open_dir: self._open_folder(d))
 
             eval_indices = all_processed_indices or target_indices
             incomplete_count = sum(1 for i in eval_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR")
@@ -5301,7 +5619,7 @@ class CProSuiteApp:
                     + f"Master Report:\n{master_report_path}"
                 )
 
-            self.root.after(0, lambda title=completion_title, msg=completion_message: messagebox.showinfo(title, msg, parent=self.root))
+            self._safe_ui_after(0, lambda title=completion_title, msg=completion_message: messagebox.showinfo(title, msg, parent=self.root))
 
         except Exception as e:
             self.log(f"[CRITICAL ERROR] Automation failed: {e}")
