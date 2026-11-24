@@ -54,5 +54,6 @@ $RECYCLE.BIN/
 
 # User local configs
 cpro_saved_accounts.json
+cpro_check_state.json
 
 *.log

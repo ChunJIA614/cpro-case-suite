@@ -48,10 +48,12 @@ Law firms acting on behalf of banking institutions frequently process large scan
 
 ## 🚀 Key Features
 
-### 👤 Dynamic User-Entered Account Management
+### 👤 Dynamic Account Management, DB Linking & Persistent Check State
 - **No Hardcoded Accounts**: Enter any C-PRO username and session password directly in the sidebar.
 - **Dynamic Account List**: Add, toggle on/off, or remove (`✕`) as many C-PRO accounts as needed.
-- **Safe Username Persistence**: Usernames and enabled states are saved locally in `cpro_saved_accounts.json`.
+- **Account Link Groups (Shared DBs)**: Assign accounts that connect to the same C-PRO database into a shared **DB Link Group** (via the **DB Link** selector on each card or **`🔗 Link Accounts`** — e.g., `Account 1 & 2 → Link 1`, `Account 3 & 4 → Link 2`). Linked accounts share section/case check history without re-searching the same DB, and split remaining cases in parallel when run with multiple browsers.
+- **Persistent Checking Condition (`cpro_check_state.json`)**: Automatically persists all queued cases, row checkmarks (`☑`), partial/completed statuses, per-section/per-DB check history, and UI preferences across **Stop & Restart**, **Close & Reopen**, and **Account Switching**. Use **`↺ Reset Status`** when you explicitly want to reset selected rows back to `Pending`.
+- **Safe Username & Link Persistence**: Usernames, enabled states, and DB link groups are saved locally in `cpro_saved_accounts.json`.
 - **Strict In-Memory Password Protection**: Passwords remain strictly in runtime RAM and are **never** written to disk.
 
 ### 🔍 Zero-Setup Scanned PDF & Multi-Invoice Extractor
@@ -61,6 +63,7 @@ Law firms acting on behalf of banking institutions frequently process large scan
 - **Multi-Signal Amount & Metadata Extraction**: Extracts `Invoice No`, `Invoice Date`, `Invoice Amount` (cross-checked via `RINGGIT MALAYSIA` words, `Sub Total + Service Tax`, and totals), `Account No`, `Alt Account No` (paired `&` accounts and credit card `c:` numbers), `Borrower Name`, and exact `Invoice Pages`.
 
 ### ⚡ High-Efficiency Portal Automation & Zero-Touch Folder Workflow
+- **Dynamic Live Multi-Browser Scaling (`1 ↔ 2–4` Browsers Anytime)**: When multiple distinct C-PRO accounts are enabled, click **`Browsers: 1 | 2 | 3 | 4`** in the action bar (before or **at any time mid-run**) to extend from 1 browser to 2–4 concurrent Chrome browsers—or scale back down to 1 browser without restarting. Thread-safe per-case upload locks prevent duplicate uploads and extra browsers yield cleanly at the next case boundary with zero lost work.
 - **Pooled Persistent Browser Sessions**: Reuses authenticated Playwright browser contexts across consecutive PDF batches in a run without closing and re-logging in between PDFs (re-authenticating only if kicked out).
 - **Learned Account Affinity**: Orders enabled C-PRO logins by learned match history and 4-digit account prefix hits so matching branch logins run first.
 - **Tuned Grid & Restore Timings**: Faster `fast_restore` section transitions after `< BACK` and tighter DevExtreme XHR/stability polling reduce per-case overhead.
@@ -79,7 +82,7 @@ Law firms acting on behalf of banking institutions frequently process large scan
   2. For any existing `E-INVOICE` row, clicks the **Eye (Preview)** icon, inspects the `Preview Document` modal (PDF network/embed bytes or screenshot OCR, with Download fallback), and only skips if it matches the target `Invoice No` / `Date & Amount`.
   3. Otherwise, extracts **only** that invoice's page(s) into `extracted_invoices/` and submits **Add New Document** (`Document Name = E-INVOICE`, `Document Type = Others`, blank `Remark`) before marking the case **`COMPLETE`**.
 - **Configurable Verification Toggle**: Toggle **Verify Billings & Upload E-INVOICE** in the sidebar to run the full end-to-end workflow or availability-only checking.
-- **Row Controls & Error Recovery**: Interactive row checkboxes (`☑` / `☐`), **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**, **`☑ Select This PDF`**, **`✕ Remove PDF`**, DPI-aware scrollable double-click row editing (Account, Name, Invoice No, Date, Amount, Source PDF, Pages), and up to 3 automatic `CHECK ERROR` recovery passes per PDF batch.
+- **Row Controls & Error Recovery**: Interactive row checkboxes (`☑` / `☐`), **`Select All`**, **`Deselect All`**, **`Select Pending`**, **`Select Errors`**, **`↺ Reset Status`**, **`☑ Select This PDF`**, **`✕ Remove PDF`**, DPI-aware scrollable double-click row editing (Account, Name, Invoice No, Date, Amount, Source PDF, Pages), and up to 3 automatic `CHECK ERROR` recovery passes per PDF batch.
 
 ### 🛡️ DevExtreme dxDataGrid Stabilization & Session Recovery
 - **Active XHR & Fetch Tracking**: Monitors in-flight requests and DevExtreme load panels before reading tables.
@@ -88,11 +91,10 @@ Law firms acting on behalf of banking institutions frequently process large scan
 - **Portal Role-Selection (`LAW FIRM`) Auto-Entry**: Automatically detects when C-PRO logs out to the *"Welcome Back / Sign in to get started"* portal role selector and clicks **`LAW FIRM`** to enter the login page.
 - **Anti-Kickout Auto-Recovery**: Detects session kickouts/timeouts (`"Logged in from another location"`, `"Error! Unauthenticated"`), re-authenticates, restores the active section, and continues seamlessly.
 
-### 📊 Per-PDF & Master Excel Output Management
-- **Separate Excel Files per PDF**:
-  - **Per-PDF Extracted Cases**: `extracted_cases_<pdf_name>.xlsx` is saved immediately as each PDF is scanned/extracted.
-  - **Per-PDF Final C-PRO Report**: `cpro_availability_report_<pdf_name>.xlsx` (with **`Summary_Report`**, **`Action_Required`** for pending/mismatch/error rows, and **`All_Checks_Detail`** worksheets for that specific PDF) is saved immediately when each PDF batch completes its C-PRO check.
-  - **Master Combined Queue & Report**: Also maintains `extracted_cases.xlsx` and `cpro_availability_report.xlsx` (each with `Summary_Report`, `Action_Required`, and `All_Checks_Detail`) across all queued PDF batches.
+### 📊 Per-PDF & Master C-PRO Availability Excel Reports
+- **Availability Reports Generated After Checking**:
+  - **Per-PDF Final C-PRO Report**: `cpro_availability_report_<pdf_name>.xlsx` (with **`Summary_Report`**, **`Action_Required`** for pending/mismatch/error rows, and **`All_Checks_Detail`** worksheets for that specific PDF) is saved immediately when each PDF batch completes its C-PRO check. *(No intermediate `extracted_cases*.xlsx` files are generated; queued cases and checking state persist in `cpro_check_state.json`.)*
+  - **Master Combined Report**: Also maintains `cpro_availability_report.xlsx` (`Summary_Report`, `Action_Required`, and `All_Checks_Detail`) across all queued PDF batches after C-PRO checking finishes.
 - **Lock-Resistant Fallback System**: Automatically saves timestamped fallbacks in writable system folders (`Script Directory` → `Desktop` → `Documents` → `AppData` → `Temp`) if Excel locks the target workbook.
 
 ---
@@ -113,7 +115,7 @@ flowchart TD
     F -- No (Invoice Page) --> H["Group Multi-Page Invoices by Invoice No"]
     H --> I["Extract Invoice No, Date, Pages,\nAccounts & Layout-Aware Borrower Name"]
     I --> J["Multi-Signal Amount Consensus\n(Ringgit Words + SubTotal/Tax + Totals)"]
-    J --> K["Queue in Interactive Table &\nSave extracted_cases.xlsx"]
+    J --> K["Queue in Interactive Table &\nPersist cpro_check_state.json"]
 ```
 
 ---
@@ -149,14 +151,14 @@ flowchart TD
 
 1. **Header Bar**: Displays application identity and live status badge (`Ready`, `Extracting PDFs...`, `Checking C-PRO...`, `Re-checking errors...`, `Stopped`).
 2. **Left Sidebar**:
-   - **C-PRO ACCOUNTS**: Dynamic account cards with enable checkbox, Username, masked Session Password (`•`), **`Show Passwords`**, **`＋ Add Account`**, and **`✕ Remove`**.
+   - **C-PRO ACCOUNTS**: Dynamic account cards with enable checkbox, DB Link badge (`🔗 Link 1`), Username, masked Session Password (`•`), **`DB Link`** group selector, **`Show Passwords`**, **`＋ Add Account`**, **`🔗 Link Accounts`**, and **`✕ Remove`**.
    - **SECTIONS TO CHECK**: *Case In Progress*, *Case Withhold*, *Case Withdrawn*.
    - **SEARCH STRATEGY**: *Account No → Fallback to Name*, *Account No Only*, *Borrower Name Only*.
    - **BILLING & UPLOAD WORKFLOW**: Toggle **Verify Billings & Upload E-INVOICE**.
    - **Show Live Chrome Browser**: Watch Playwright live or run headless.
-   - **EXCEL FILES & OUTPUTS**: Quick buttons for `extracted_cases.xlsx`, `cpro_availability_report.xlsx`, and the output folder.
+   - **EXCEL FILES & OUTPUTS**: Quick buttons for **`Open Final C-PRO Report Excel`** (`cpro_availability_report_<pdf>.xlsx` / `cpro_availability_report.xlsx`) and **`📂 Open Output Folder`**.
 3. **Main Content Area**:
-   - **Action Bar**: **`＋ Upload & Extract PDFs`**, **`＋ Add Manual Row`**, **`Import Excel`**, **`Clear List`**, **`▶ Start C-PRO Check`**, **`■ Stop`**.
+   - **Action Bar**: **`＋ Upload & Extract PDFs`** (*or **`＋ Queue More PDFs`** while running*), **`＋ Add Manual Row`**, **`Import Excel`**, **`Clear List`**, **`Browsers: 1 | 2 | 3 | 4`** (*live scaling with `Active: N/M` status*), **`▶ Start C-PRO Check`**, **`■ Stop`**.
    - **Cases Queue Table**: Columns for `☑`, `#`, `Invoice No`, `Account No`, `Borrower Name`, `Inv Date`, `Inv Amt`, `Pages`, `Status`, `Account(s)`, `Billing Check`, `Upload Status` with color-coded statuses:
      - 🟢 **`COMPLETE`** / **`AVAILABLE`**: Verified & completed (or available in check-only mode).
      - 🔴 **`NOT FOUND`** / **`NONE (Billing Mismatch)`**: Absent or failed Billing verification across all checked rows/accounts.
@@ -227,10 +229,11 @@ playwright install chromium
 ## 📈 Generated Excel Reports & Extracted PDFs
 
 - **Split Single-Invoice PDFs**: Saved in `extracted_invoices/<InvoiceNo>_<AccountNo>_p<Pages>.pdf` inside the output directory only for cases that pass Billing verification (and require upload).
-- **Queue Workbook (`extracted_cases.xlsx`)**: Persists extracted invoice metadata, source PDF paths, and page ranges across restarts.
-- **Final Report (`cpro_availability_report.xlsx`)**:
+- **Persistent Queue & Checking State (`cpro_check_state.json`)**: Automatically preserves queued cases, DB link coverage, section/case check history, and results across Stop/Restart, Close/Reopen, and Account Switching without writing intermediate `extracted_cases*.xlsx` workbooks.
+- **Final Report (`cpro_availability_report_<pdf>.xlsx` & `cpro_availability_report.xlsx`)**:
   - **`Summary_Report`**: `Source File`, `Source PDF Path`, `Invoice Pages`, `Invoice No`, `Invoice Date`, `Invoice Amount`, `Account No`, `Alt Account No`, `Search Name`, `Full Borrower Name`, `Availability Status`, `Found In Account(s)`, `Found In Section(s)`, `Billing Check`, `Upload Status`, `Extracted Invoice PDF`, `C-PRO Row Details`.
-  - **`All_Checks_Detail`**: `Invoice No`, `Account No`, `Search Name`, `C-PRO Account`, `Login Used`, `Section`, `Status`, `Matched By`, `Billing Check`, `Upload Status`, `C-PRO Row Details`, `Round`.
+  - **`Action_Required`**: Filtered view of cases still needing manual follow-up (`Pending`, `CHECK ERROR`, `NOT FOUND`, `NONE (Billing Mismatch)`).
+  - **`All_Checks_Detail`**: `Invoice No`, `Account No`, `Search Name`, `C-PRO Account`, `Login Used`, `DB Link Group`, `Section`, `Status`, `Matched By`, `Billing Check`, `Upload Status`, `C-PRO Row Details`, `Round`.
 
 ---
 

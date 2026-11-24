@@ -11,6 +11,7 @@ import threading
 import subprocess
 import ctypes
 import tempfile
+from collections import deque
 from decimal import Decimal, InvalidOperation
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -84,6 +85,16 @@ MAX_ERROR_RECOVERY_ROUNDS = 3
 GRID_SETTLE_TIMEOUT_MS = 30000
 CHECKED_GLYPH = "☑"
 UNCHECKED_GLYPH = "☐"
+INDEPENDENT_LINK_LABEL = "Independent (Own DB)"
+DEFAULT_LINK_GROUPS = ["Link 1", "Link 2", "Link 3", "Link 4", "Link 5"]
+LINK_BADGE_PALETTE = [
+    ("#E3F2FD", "#0D47A1"),
+    ("#F3E5F5", "#6A1B9A"),
+    ("#E0F2F1", "#00695C"),
+    ("#FFF3E0", "#E65100"),
+    ("#FCE4EC", "#AD1457"),
+    ("#E8EAF6", "#283593"),
+]
 
 WINRT_BATCH_OCR_PS = r'''
 param([string]$Folder)
@@ -213,7 +224,7 @@ if not WRITABLE_OUTPUT_DIRS:
 else:
     OUTPUT_DIR = WRITABLE_OUTPUT_DIRS[0]
 
-EXTRACTED_EXCEL = os.path.join(OUTPUT_DIR, "extracted_cases.xlsx")
+CHECK_STATE_FILE = os.path.join(OUTPUT_DIR, "cpro_check_state.json")
 REPORT_EXCEL = os.path.join(OUTPUT_DIR, "cpro_availability_report.xlsx")
 EXTRACTED_INVOICES_DIR = os.path.join(OUTPUT_DIR, "extracted_invoices")
 OCR_CACHE_DIR = os.path.join(OUTPUT_DIR, ".cpro_ocr_cache")
@@ -524,9 +535,12 @@ def extract_invoice_pdf_pages(source_pdf_path, page_numbers, dest_pdf_path):
     if added == 0:
         raise ValueError(f"Requested page(s) {pages} out of range for '{os.path.basename(source_pdf_path)}' ({total_pages} pages).")
 
-    os.makedirs(os.path.dirname(os.path.abspath(dest_pdf_path)), exist_ok=True)
-    with open(dest_pdf_path, "wb") as f:
+    abs_dest = os.path.abspath(dest_pdf_path)
+    os.makedirs(os.path.dirname(abs_dest), exist_ok=True)
+    tmp_dest = f"{abs_dest}.{threading.get_ident()}.tmp"
+    with open(tmp_dest, "wb") as f:
         writer.write(f)
+    os.replace(tmp_dest, abs_dest)
     return dest_pdf_path
 
 
@@ -1227,13 +1241,22 @@ class CProSuiteApp:
         self.cases_data = []
         self.is_running = False
         self.stop_requested = False
-        self.last_extracted_path = EXTRACTED_EXCEL
         self.last_report_path = REPORT_EXCEL
+        self.check_state_path = CHECK_STATE_FILE
+        self._tls = threading.local()
         self._last_searched_column = None
+        self._handling_timeout_popup = False
+        self._target_browsers = 1
+        self._active_browser_count = 0
+        self._browser_ctrl_lock = threading.Lock()
+        self._auth_prompt_lock = threading.Lock()
+        self._pool_cond = threading.Condition()
+        self._state_save_lock = threading.Lock()
 
         self.accounts = []
         self.show_pwd = tk.BooleanVar(value=False)
         self.accounts_config_path = os.path.join(OUTPUT_DIR, "cpro_saved_accounts.json")
+        self._custom_link_groups = []
 
         self.sec_in_progress = tk.BooleanVar(value=True)
         self.sec_withhold = tk.BooleanVar(value=True)
@@ -1245,13 +1268,14 @@ class CProSuiteApp:
         self.watch_scanned_folder = tk.BooleanVar(value=False)
         self.auto_archive_completed_pdfs = tk.BooleanVar(value=False)
         self.show_browser = tk.BooleanVar(value=True)
+        self.parallel_browsers_var = tk.IntVar(value=1)
 
         self.pdf_batch_filter_var = tk.StringVar(value="All Queued PDFs (0 files · 0 records)")
         self._selected_pdf_source = "ALL"
         self._pdf_combo_map = {"All Queued PDFs (0 files · 0 records)": "ALL"}
         self.pdf_batch_status = {}
-        self.extracted_excel_paths = {}
         self.report_excel_paths = {}
+        self.detailed_logs_by_source = {}
         self._queued_pdf_paths = []
         self._pdf_queue_lock = threading.Lock()
         self._cases_lock = threading.Lock()
@@ -1263,10 +1287,11 @@ class CProSuiteApp:
 
         self._configure_styles()
         self._build_layout()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_app_close)
         self._load_saved_accounts()
         self.log(f"Output folder: {OUTPUT_DIR}")
-        self._auto_load_existing_excel()
-        self._safe_ui_after(3000, self._poll_watched_folder)
+        self._load_check_state_or_legacy()
+        self._watch_after_id = self._safe_ui_after(3000, self._poll_watched_folder)
 
     def _configure_styles(self):
         style = ttk.Style()
@@ -1380,7 +1405,7 @@ class CProSuiteApp:
         card1_outer, card1 = self._create_card(sidebar)
         card1_outer.pack(fill="x", pady=(0, 12))
         tk.Label(card1, text="C-PRO ACCOUNTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w")
-        tk.Label(card1, text="Enter your C-PRO usernames & session passwords.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=330, justify="left").pack(anchor="w", pady=(2, 8))
+        tk.Label(card1, text="Enter C-PRO usernames, session passwords, and optional DB Link Group for accounts sharing the same database.", font=("Segoe UI", 8), bg=THEME["card"], fg=THEME["subtext"], wraplength=330, justify="left").pack(anchor="w", pady=(2, 8))
 
         self.accounts_list_frame = tk.Frame(card1, bg=THEME["card"])
         self.accounts_list_frame.pack(fill="x", expand=True)
@@ -1395,11 +1420,29 @@ class CProSuiteApp:
             bg=THEME["card"], fg=THEME["subtext"], activebackground=THEME["card"], font=("Segoe UI", 8), anchor="w",
         ).pack(fill="x", pady=(6, 4))
 
+        acc_btn_row = tk.Frame(card1, bg=THEME["card"])
+        acc_btn_row.pack(fill="x")
         self.btn_add_acc = self._create_button(
-            card1, "＋ Add Account", lambda: self._add_account_row(),
+            acc_btn_row, "＋ Add Account", lambda: self._add_account_row(),
             bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"],
         )
-        self.btn_add_acc.pack(fill="x")
+        self.btn_add_acc.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.btn_link_accs = self._create_button(
+            acc_btn_row, "🔗 Link Accounts", self.on_manage_link_groups,
+            bg="#EBF5FF", fg=THEME["blue"], hover_bg="#D8EAFE",
+        )
+        self.btn_link_accs.pack(side="left", fill="x", expand=True)
+
+        self.lbl_link_summary = tk.Label(
+            card1,
+            text="No accounts linked (each uses its own DB)",
+            font=("Segoe UI", 7),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=330,
+            justify="left",
+        )
+        self.lbl_link_summary.pack(anchor="w", pady=(5, 0))
 
         card2_outer, card2 = self._create_card(sidebar)
         card2_outer.pack(fill="x", pady=(0, 12))
@@ -1489,13 +1532,22 @@ class CProSuiteApp:
 
         tk.Frame(card2, bg=THEME["border"], height=1).pack(fill="x", pady=8)
         tk.Checkbutton(card2, text="Show Live Chrome Browser", variable=self.show_browser, bg=THEME["card"], fg=THEME["text"], activebackground=THEME["card"], font=("Segoe UI", 9), anchor="w").pack(fill="x")
+        tk.Label(
+            card2,
+            text="Use 'Browsers: 1 | 2 | 3 | 4' above to run multiple distinct accounts simultaneously or scale 1 ↔ 2+ anytime.",
+            font=("Segoe UI", 7),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=330,
+            justify="left",
+        ).pack(anchor="w", padx=(20, 0), pady=(1, 2))
 
         card3_outer, card3 = self._create_card(sidebar)
         card3_outer.pack(fill="x", pady=(0, 12))
         tk.Label(card3, text="EXCEL FILES & OUTPUTS", font=("Segoe UI Semibold", 8), bg=THEME["card"], fg=THEME["subtext"]).pack(anchor="w", pady=(0, 4))
         tk.Label(
             card3,
-            text="Each PDF saves its own extracted_cases_<pdf>.xlsx and cpro_availability_report_<pdf>.xlsx.",
+            text="Each PDF saves its own cpro_availability_report_<pdf>.xlsx after C-PRO checking.",
             font=("Segoe UI", 7),
             bg=THEME["card"],
             fg=THEME["subtext"],
@@ -1503,15 +1555,306 @@ class CProSuiteApp:
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
-        self._create_button(card3, "Open Extracted Cases Excel", self._open_selected_extracted_excel, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
         self._create_button(card3, "Open Final C-PRO Report Excel", self._open_selected_report_excel, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x", pady=(0, 6))
         self._create_button(card3, "📂 Open Output Folder", lambda: self._open_folder(OUTPUT_DIR), bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"]).pack(fill="x")
 
-    def _add_account_row(self, username="", enabled=True):
+    @staticmethod
+    def _normalize_link_group(value):
+        raw = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not raw:
+            return ""
+        low = raw.casefold()
+        if low in (
+            INDEPENDENT_LINK_LABEL.casefold(),
+            "independent",
+            "none",
+            "no link",
+            "unlinked",
+            "-",
+        ):
+            return ""
+        return raw
+
+    @staticmethod
+    def _get_account_db_scope(acc_or_username, link_group=""):
+        if isinstance(acc_or_username, dict):
+            username = acc_or_username.get("username", "")
+            grp = link_group or acc_or_username.get("link_group", "")
+        else:
+            username = str(acc_or_username or "")
+            grp = link_group
+        norm_grp = CProSuiteApp._normalize_link_group(grp)
+        if norm_grp:
+            return f"GROUP:{norm_grp.casefold()}"
+        return f"USER:{str(username).strip().casefold()}"
+
+    @staticmethod
+    def _get_link_badge_colors(group_name):
+        norm = CProSuiteApp._normalize_link_group(group_name)
+        if not norm:
+            return ("#E8E8ED", THEME["subtext"])
+        lowered = [g.casefold() for g in DEFAULT_LINK_GROUPS]
+        if norm.casefold() in lowered:
+            idx = lowered.index(norm.casefold())
+        else:
+            idx = sum(ord(ch) for ch in norm.casefold()) % len(LINK_BADGE_PALETTE)
+        return LINK_BADGE_PALETTE[idx % len(LINK_BADGE_PALETTE)]
+
+    def _get_available_link_group_choices(self):
+        choices = [INDEPENDENT_LINK_LABEL]
+        seen = {INDEPENDENT_LINK_LABEL.casefold()}
+        candidates = list(DEFAULT_LINK_GROUPS) + list(getattr(self, "_custom_link_groups", []) or [])
+        for acc in getattr(self, "accounts", []) or []:
+            lv = acc.get("link_group")
+            val = lv.get() if hasattr(lv, "get") else lv
+            norm = self._normalize_link_group(val)
+            if norm:
+                candidates.append(norm)
+        for cand in candidates:
+            norm = self._normalize_link_group(cand)
+            if norm and norm.casefold() not in seen:
+                seen.add(norm.casefold())
+                choices.append(norm)
+        return choices
+
+    def _get_configured_account_link_map(self, active_accounts=None):
+        link_map = {}
+        for acc in getattr(self, "accounts", []) or []:
+            uv = acc.get("user") if "user" in acc else acc.get("username", "")
+            uname = (uv.get() if hasattr(uv, "get") else str(uv or "")).strip()
+            if not uname:
+                continue
+            lv = acc.get("link_group", "")
+            lval = lv.get() if hasattr(lv, "get") else str(lv or "")
+            link_map[uname.casefold()] = self._normalize_link_group(lval)
+        for acc in active_accounts or []:
+            uname = str(acc.get("username", "")).strip()
+            if not uname:
+                continue
+            if "link_group" in acc:
+                link_map[uname.casefold()] = self._normalize_link_group(acc.get("link_group", ""))
+            else:
+                link_map.setdefault(uname.casefold(), "")
+        return link_map
+
+    def _get_scope_match_identity(self, acc, active_accounts=None):
+        username = str(acc.get("username", "")).strip()
+        link_map = self._get_configured_account_link_map(active_accounts)
+        if "link_group" in acc:
+            group = self._normalize_link_group(acc.get("link_group", ""))
+        else:
+            group = link_map.get(username.casefold(), "")
+        scope_key = self._get_account_db_scope(username, group)
+        peer_scope_keys = {scope_key}
+        peer_usernames = set()
+        if username:
+            peer_scope_keys.add(f"USER:{username.casefold()}")
+            peer_usernames.add(username.casefold())
+        if group:
+            grp_cf = group.casefold()
+            for u_low, u_grp in link_map.items():
+                if u_grp and u_grp.casefold() == grp_cf:
+                    peer_usernames.add(u_low)
+                    peer_scope_keys.add(f"USER:{u_low}")
+        return scope_key, group, peer_scope_keys, peer_usernames
+
+    def _update_account_link_badge(self, acc_obj):
+        badge = acc_obj.get("link_badge")
+        if badge is None:
+            return
+        lv = acc_obj.get("link_group")
+        grp = self._normalize_link_group(lv.get() if hasattr(lv, "get") else lv)
+        if grp:
+            bg, fg = self._get_link_badge_colors(grp)
+            badge.config(text=f"🔗 {grp}", bg=bg, fg=fg)
+            if not badge.winfo_manager():
+                badge.pack(side="left", padx=(6, 0))
+        else:
+            badge.config(text="")
+            if badge.winfo_manager():
+                badge.pack_forget()
+
+    def _refresh_all_link_comboboxes(self):
+        choices = self._get_available_link_group_choices()
+        for acc in getattr(self, "accounts", []) or []:
+            cmb = acc.get("cmb_link")
+            if cmb is not None:
+                cmb["values"] = choices
+            lv = acc.get("link_group")
+            if hasattr(lv, "get"):
+                norm = self._normalize_link_group(lv.get())
+                lv.set(norm or INDEPENDENT_LINK_LABEL)
+            self._update_account_link_badge(acc)
+
+    def _refresh_link_summary(self):
+        lbl = getattr(self, "lbl_link_summary", None)
+        if lbl is None:
+            return
+        groups = {}
+        for idx, acc in enumerate(getattr(self, "accounts", []) or [], start=1):
+            uname = acc["user"].get().strip() or f"#{idx}"
+            grp = self._normalize_link_group(acc["link_group"].get())
+            if grp:
+                groups.setdefault(grp, []).append(uname)
+        if not groups:
+            lbl.config(text="No accounts linked (each uses its own DB)", fg=THEME["subtext"])
+            return
+        parts = [f"{grp}: {', '.join(names)}" for grp, names in groups.items()]
+        lbl.config(text="Linked DBs: " + " | ".join(parts), fg=THEME["blue"])
+
+    def _on_account_link_changed(self, acc_obj):
+        norm = self._normalize_link_group(acc_obj["link_group"].get())
+        acc_obj["link_group"].set(norm or INDEPENDENT_LINK_LABEL)
+        self._update_account_link_badge(acc_obj)
+        self._refresh_link_summary()
+        self._save_accounts_config()
+
+    def on_manage_link_groups(self):
+        if self.is_running:
+            return
+        if not self.accounts:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Link C-PRO Accounts (Shared DB)")
+        dialog.configure(bg=THEME["bg"])
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        card = tk.Frame(dialog, bg=THEME["card"], padx=18, pady=16, highlightbackground=THEME["border"], highlightthickness=1)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+
+        tk.Label(
+            card,
+            text="Link Accounts Sharing the Same Database",
+            font=("Segoe UI Semibold", 11),
+            bg=THEME["card"],
+            fg=THEME["text"],
+        ).pack(anchor="w")
+        tk.Label(
+            card,
+            text=(
+                "Assign accounts that connect to the same C-PRO database into the same DB Link Group "
+                "(e.g., Account 1 & 2 → Link 1, Account 3 & 4 → Link 2).\n"
+                "Linked accounts share checked history on pause/reopen/account switch and split work without duplicate searches when run together."
+            ),
+            font=("Segoe UI", 8),
+            bg=THEME["card"],
+            fg=THEME["subtext"],
+            wraplength=500,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 12))
+
+        add_grp_row = tk.Frame(card, bg="#F9F9FB", padx=10, pady=8, highlightbackground=THEME["border"], highlightthickness=1)
+        add_grp_row.pack(fill="x", pady=(0, 10))
+        tk.Label(add_grp_row, text="Custom Group Name:", font=("Segoe UI Semibold", 8), bg="#F9F9FB", fg=THEME["text"]).pack(side="left")
+        custom_var = tk.StringVar()
+        ent_custom = tk.Entry(add_grp_row, textvariable=custom_var, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=4, font=("Segoe UI", 9), width=22)
+        ent_custom.pack(side="left", padx=(8, 8), fill="x", expand=True)
+
+        rows_holder = tk.Frame(card, bg=THEME["card"])
+        rows_holder.pack(fill="both", expand=True, pady=(0, 10))
+
+        preview_lbl = tk.Label(card, text="", font=("Segoe UI", 8), bg="#F2F2F7", fg=THEME["text"], padx=10, pady=8, anchor="w", justify="left", wraplength=500)
+        preview_lbl.pack(fill="x", pady=(0, 12))
+
+        row_entries = []
+        combos = []
+
+        def _update_preview(_event=None):
+            grouped = {}
+            indep = []
+            for idx_num, uname_lbl, var in row_entries:
+                grp = self._normalize_link_group(var.get())
+                display_u = uname_lbl or f"Account #{idx_num}"
+                if grp:
+                    grouped.setdefault(grp, []).append(display_u)
+                else:
+                    indep.append(display_u)
+            lines = []
+            for grp, members in grouped.items():
+                tag = "Shared DB" if len(members) >= 2 else "Single account in group"
+                lines.append(f"• {grp}: {', '.join(members)} ({tag})")
+            if indep:
+                lines.append(f"• Independent DB: {', '.join(indep)}")
+            preview_lbl.config(text="\n".join(lines) if lines else "No accounts configured.")
+
+        for idx_num, acc in enumerate(self.accounts, start=1):
+            uname = acc["user"].get().strip()
+            cur_grp = self._normalize_link_group(acc["link_group"].get())
+            var = tk.StringVar(value=cur_grp or INDEPENDENT_LINK_LABEL)
+            rframe = tk.Frame(rows_holder, bg="#F9F9FB", padx=10, pady=6, highlightbackground=THEME["border"], highlightthickness=1)
+            rframe.pack(fill="x", pady=(0, 6))
+            en_tag = "✓ Enabled" if acc["enabled"].get() else "Off"
+            lbl_text = f"Account #{idx_num}: {uname or '(empty username)'}  [{en_tag}]"
+            tk.Label(rframe, text=lbl_text, font=("Segoe UI Semibold", 9), bg="#F9F9FB", fg=THEME["text"], anchor="w").pack(side="left", fill="x", expand=True)
+            cmb = ttk.Combobox(
+                rframe,
+                textvariable=var,
+                values=self._get_available_link_group_choices(),
+                state="readonly",
+                width=22,
+                font=("Segoe UI", 9),
+            )
+            cmb.pack(side="right")
+            cmb.bind("<<ComboboxSelected>>", _update_preview)
+            combos.append(cmb)
+            row_entries.append((idx_num, uname, var))
+
+        def _add_custom_group():
+            norm = self._normalize_link_group(custom_var.get())
+            if not norm:
+                messagebox.showwarning("Invalid Group Name", "Enter a custom DB Link Group name (e.g. 'Melaka DB' or 'Firm B').", parent=dialog)
+                return
+            existing_cf = {g.casefold() for g in self._get_available_link_group_choices()}
+            if norm.casefold() not in existing_cf:
+                self._custom_link_groups.append(norm)
+            new_vals = self._get_available_link_group_choices()
+            for cmb in combos:
+                cmb["values"] = new_vals
+            custom_var.set("")
+            _update_preview()
+
+        self._create_button(add_grp_row, "＋ Add Group", _add_custom_group, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=10, pady=4, font_size=8).pack(side="right")
+        _update_preview()
+
+        btn_bar = tk.Frame(card, bg=THEME["card"])
+        btn_bar.pack(fill="x")
+
+        def _save_links():
+            for acc, (_idx_num, _uname, var) in zip(self.accounts, row_entries):
+                norm = self._normalize_link_group(var.get())
+                if norm and norm.casefold() not in {g.casefold() for g in self._get_available_link_group_choices()}:
+                    self._custom_link_groups.append(norm)
+                acc["link_group"].set(norm or INDEPENDENT_LINK_LABEL)
+            self._refresh_all_link_comboboxes()
+            self._refresh_link_summary()
+            self._save_accounts_config()
+            self._save_check_state()
+            self.log(f"[ACCOUNTS] Updated DB Link Groups -> {self.lbl_link_summary.cget('text')}")
+            dialog.destroy()
+
+        self._create_button(btn_bar, "Save Links", _save_links, bg=THEME["blue"], hover_bg=THEME["blue_hover"], padx=16).pack(side="right")
+        self._create_button(btn_bar, "Cancel", dialog.destroy, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=14).pack(side="right", padx=(0, 8))
+
+        dialog.update_idletasks()
+        w = max(560, dialog.winfo_reqwidth())
+        h = min(dialog.winfo_reqheight(), max(460, int(self.root.winfo_screenheight() * 0.8)))
+        px = self.root.winfo_rootx() + max(20, (self.root.winfo_width() - w) // 2)
+        py = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - h) // 2)
+        dialog.geometry(f"{w}x{h}+{px}+{py}")
+        dialog.deiconify()
+
+    def _add_account_row(self, username="", enabled=True, link_group=""):
         idx = len(self.accounts) + 1
         user_var = tk.StringVar(value=username)
         pwd_var = tk.StringVar()
         enable_var = tk.BooleanVar(value=enabled)
+        norm_link = self._normalize_link_group(link_group)
+        if norm_link and norm_link.casefold() not in {g.casefold() for g in DEFAULT_LINK_GROUPS + list(getattr(self, "_custom_link_groups", []))}:
+            self._custom_link_groups.append(norm_link)
+        link_var = tk.StringVar(value=norm_link or INDEPENDENT_LINK_LABEL)
 
         card = tk.Frame(self.accounts_list_frame, bg=THEME["card"])
         card.pack(fill="x", expand=True, pady=(0, 6))
@@ -1529,6 +1872,8 @@ class CProSuiteApp:
         )
         chk.pack(side="left")
 
+        link_badge = tk.Label(top_line, text="", font=("Segoe UI Semibold", 7), padx=6, pady=1)
+
         del_btn = tk.Label(top_line, text="✕ Remove", bg="#F9F9FB", fg=THEME["subtext"], cursor="hand2", font=("Segoe UI", 8))
         del_btn.pack(side="right")
 
@@ -1541,7 +1886,7 @@ class CProSuiteApp:
         ent_user.pack(fill="x")
 
         p_box = tk.Frame(box, bg="#F9F9FB")
-        p_box.pack(fill="x", pady=(1, 2))
+        p_box.pack(fill="x", pady=(1, 3))
         tk.Label(p_box, text="Session Password:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(anchor="w")
         p_border = tk.Frame(p_box, bg=THEME["border"], padx=1, pady=1)
         p_border.pack(fill="x", pady=(1, 0))
@@ -1549,22 +1894,43 @@ class CProSuiteApp:
         ent_pwd = tk.Entry(p_border, textvariable=pwd_var, show=show_char, bg=THEME["card"], fg=THEME["text"], relief="flat", bd=4, font=("Segoe UI", 9))
         ent_pwd.pack(fill="x")
 
+        link_box = tk.Frame(box, bg="#F9F9FB")
+        link_box.pack(fill="x", pady=(2, 1))
+        tk.Label(link_box, text="DB Link:", font=("Segoe UI", 8), bg="#F9F9FB", fg=THEME["subtext"]).pack(side="left", padx=(0, 6))
+        cmb_link = ttk.Combobox(
+            link_box,
+            textvariable=link_var,
+            values=self._get_available_link_group_choices(),
+            state="readonly",
+            font=("Segoe UI", 8),
+        )
+        cmb_link.pack(side="left", fill="x", expand=True)
+
         acc_obj = {
             "user": user_var,
             "pwd": pwd_var,
             "enabled": enable_var,
+            "link_group": link_var,
+            "link_badge": link_badge,
+            "cmb_link": cmb_link,
             "card": card,
             "chk": chk,
             "ent_pwd": ent_pwd,
             "del_btn": del_btn,
         }
 
+        cmb_link.bind("<<ComboboxSelected>>", lambda _e, a=acc_obj: self._on_account_link_changed(a))
+        chk.config(command=self._save_accounts_config)
+        ent_user.bind("<FocusOut>", lambda _e: (self._refresh_link_summary(), self._save_accounts_config()))
+
         del_btn.bind("<Button-1>", lambda e, a=acc_obj: self._remove_account_row(a))
         del_btn.bind("<Enter>", lambda e, b=del_btn: b.config(fg=THEME["red"]))
         del_btn.bind("<Leave>", lambda e, b=del_btn: b.config(fg=THEME["subtext"]))
 
         self.accounts.append(acc_obj)
+        self._update_account_link_badge(acc_obj)
         self._refresh_account_indices()
+        self._refresh_link_summary()
         self.sidebar_canvas.update_idletasks()
         self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
 
@@ -1573,10 +1939,15 @@ class CProSuiteApp:
             acc_obj["user"].set("")
             acc_obj["pwd"].set("")
             acc_obj["enabled"].set(True)
+            acc_obj["link_group"].set(INDEPENDENT_LINK_LABEL)
+            self._update_account_link_badge(acc_obj)
+            self._refresh_link_summary()
+            self._save_accounts_config()
             return
         acc_obj["card"].destroy()
         self.accounts.remove(acc_obj)
         self._refresh_account_indices()
+        self._refresh_link_summary()
         self.sidebar_canvas.update_idletasks()
         self.sidebar_canvas.configure(scrollregion=self.sidebar_canvas.bbox("all"))
         self._save_accounts_config()
@@ -1597,23 +1968,38 @@ class CProSuiteApp:
                 self.log(f"Could not load saved accounts: {e}")
 
         if not saved_list:
-            saved_list = [{"username": "", "enabled": True}, {"username": "", "enabled": False}]
+            saved_list = [
+                {"username": "", "enabled": True, "link_group": ""},
+                {"username": "", "enabled": False, "link_group": ""},
+            ]
 
         for item in saved_list:
-            u = item.get("username", "") if isinstance(item, dict) else str(item)
-            en = item.get("enabled", True) if isinstance(item, dict) else True
-            self._add_account_row(username=u, enabled=en)
+            if isinstance(item, dict):
+                u = item.get("username", "")
+                en = item.get("enabled", True)
+                lg = self._normalize_link_group(item.get("link_group", ""))
+            else:
+                u = str(item)
+                en = True
+                lg = ""
+            self._add_account_row(username=u, enabled=en, link_group=lg)
+        self._refresh_all_link_comboboxes()
+        self._refresh_link_summary()
 
     def _save_accounts_config(self):
         data = []
         for acc in self.accounts:
             u = acc["user"].get().strip()
-            if u:
-                data.append({"username": u, "enabled": acc["enabled"].get()})
+            lg = self._normalize_link_group(acc["link_group"].get())
+            if u or lg:
+                data.append({"username": u, "enabled": acc["enabled"].get(), "link_group": lg})
         try:
-            os.makedirs(os.path.dirname(self.accounts_config_path), exist_ok=True)
-            with open(self.accounts_config_path, "w", encoding="utf-8") as f:
+            parent_dir = os.path.dirname(os.path.abspath(self.accounts_config_path))
+            os.makedirs(parent_dir, exist_ok=True)
+            tmp_path = f"{self.accounts_config_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            os.replace(tmp_path, self.accounts_config_path)
         except Exception as e:
             self.log(f"Notice: Could not save accounts configuration: {e}")
 
@@ -1636,6 +2022,37 @@ class CProSuiteApp:
         self.btn_run_cpro = self._create_button(bar, "▶ Start C-PRO Check", self.on_start_cpro_check, bg=THEME["green"], hover_bg=THEME["green_hover"])
         self.btn_run_cpro.pack(side="right", padx=(0, 8))
 
+        # Live parallel browser selector (1 <-> 2+ anytime, even while automation is running)
+        browser_ctrl = tk.Frame(bar, bg="#F2F2F7", padx=8, pady=4, highlightbackground=THEME["border"], highlightthickness=1)
+        browser_ctrl.pack(side="right", padx=(0, 10))
+        tk.Label(
+            browser_ctrl, text="Browsers:", font=("Segoe UI Semibold", 8), bg="#F2F2F7", fg=THEME["subtext"]
+        ).pack(side="left", padx=(0, 4))
+        self.browser_count_buttons = {}
+        for n in (1, 2, 3, 4):
+            is_sel = n == 1
+            b = tk.Button(
+                browser_ctrl,
+                text=str(n),
+                command=lambda cnt=n: self.set_target_browser_count(cnt),
+                bg=THEME["blue"] if is_sel else THEME["neutral_btn"],
+                fg="#FFFFFF" if is_sel else THEME["text"],
+                activebackground=THEME["blue_hover"],
+                activeforeground="#FFFFFF",
+                relief="flat",
+                bd=0,
+                width=2,
+                pady=2,
+                cursor="hand2",
+                font=("Segoe UI Semibold", 8),
+            )
+            b.pack(side="left", padx=1)
+            self.browser_count_buttons[n] = b
+        self.lbl_active_browsers = tk.Label(
+            browser_ctrl, text="Active: 0/1", font=("Segoe UI", 8), bg="#F2F2F7", fg=THEME["subtext"], padx=6
+        )
+        self.lbl_active_browsers.pack(side="left")
+
         table_outer, table_card = self._create_card(content, padx=0, pady=0)
         table_outer.pack(fill="both", expand=True, pady=(0, 12))
         table_header = tk.Frame(table_card, bg=THEME["card"], padx=16)
@@ -1652,7 +2069,9 @@ class CProSuiteApp:
         self.btn_select_pending = self._create_button(sel_bar, "Select Pending", self.on_select_pending_rows, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=8, pady=3, font_size=8)
         self.btn_select_pending.pack(side="left", padx=(0, 5))
         self.btn_select_errors = self._create_button(sel_bar, "Select Errors", self.on_select_error_rows, bg="#FFF4D6", fg="#8A5A00", hover_bg="#FFE8AD", padx=8, pady=3, font_size=8)
-        self.btn_select_errors.pack(side="left")
+        self.btn_select_errors.pack(side="left", padx=(0, 5))
+        self.btn_reset_status = self._create_button(sel_bar, "↺ Reset Status", self.on_reset_selected_status, bg=THEME["neutral_btn"], fg=THEME["text"], hover_bg=THEME["neutral_hover"], padx=8, pady=3, font_size=8)
+        self.btn_reset_status.pack(side="left")
 
         tip_row = tk.Frame(table_card, bg=THEME["card"], padx=16)
         tip_row.pack(fill="x", pady=(0, 6))
@@ -1766,14 +2185,105 @@ class CProSuiteApp:
         self.log_text = tk.Text(log_card, height=6, bg="#F9F9FB", fg=THEME["text"], relief="flat", bd=6, font=("Consolas", 9), state="disabled")
         self.log_text.pack(fill="x")
 
+    def _get_tls(self):
+        tls = self.__dict__.get("_tls")
+        if tls is None:
+            tls = threading.local()
+            self.__dict__["_tls"] = tls
+        return tls
+
+    @property
+    def _last_searched_column(self):
+        return getattr(self._get_tls(), "last_searched_column", None)
+
+    @_last_searched_column.setter
+    def _last_searched_column(self, value):
+        self._get_tls().last_searched_column = value
+
+    @property
+    def _handling_timeout_popup(self):
+        return bool(getattr(self._get_tls(), "handling_timeout_popup", False))
+
+    @_handling_timeout_popup.setter
+    def _handling_timeout_popup(self, value):
+        self._get_tls().handling_timeout_popup = bool(value)
+
+    def _get_browser_ctrl_lock(self):
+        lock = self.__dict__.get("_browser_ctrl_lock")
+        if lock is None:
+            lock = threading.Lock()
+            self.__dict__["_browser_ctrl_lock"] = lock
+        return lock
+
+    def _get_auth_prompt_lock(self):
+        lock = self.__dict__.get("_auth_prompt_lock")
+        if lock is None:
+            lock = threading.Lock()
+            self.__dict__["_auth_prompt_lock"] = lock
+        return lock
+
+    def _get_pool_cond(self):
+        cond = self.__dict__.get("_pool_cond")
+        if cond is None:
+            cond = threading.Condition()
+            self.__dict__["_pool_cond"] = cond
+        return cond
+
+    def get_target_browser_count(self):
+        with self._get_browser_ctrl_lock():
+            val = self.__dict__.get("_target_browsers", 1)
+        return max(1, min(4, int(val)))
+
+    def _update_browser_count_ui(self):
+        target = self.get_target_browser_count()
+        active = int(self.__dict__.get("_active_browser_count", 0))
+
+        def _upd():
+            btns = getattr(self, "browser_count_buttons", None)
+            if isinstance(btns, dict):
+                for n, btn in btns.items():
+                    if n == target:
+                        btn.config(bg=THEME["blue"], fg="#FFFFFF")
+                    else:
+                        btn.config(bg=THEME["neutral_btn"], fg=THEME["text"])
+            lbl = getattr(self, "lbl_active_browsers", None)
+            if lbl is not None:
+                if self.is_running and active > target:
+                    lbl.config(text=f"Active: {active} → {target}", fg="#8A5A00")
+                elif self.is_running:
+                    lbl.config(text=f"Active: {active}/{target}", fg=THEME["blue"])
+                else:
+                    lbl.config(text=f"Active: 0/{target}", fg=THEME["subtext"])
+            var = getattr(self, "parallel_browsers_var", None)
+            if var is not None:
+                var.set(target)
+
+        self._safe_ui_after(0, _upd)
+
+    def set_target_browser_count(self, count):
+        new_count = max(1, min(4, int(count)))
+        with self._get_browser_ctrl_lock():
+            old_count = int(self.__dict__.get("_target_browsers", 1))
+            self._target_browsers = new_count
+        self._update_browser_count_ui()
+        cond = self._get_pool_cond()
+        with cond:
+            cond.notify_all()
+        if new_count != old_count:
+            if self.is_running:
+                direction = "Extending" if new_count > old_count else "Scaling down"
+                self.log(f"[PARALLEL] {direction} live browser target from {old_count} -> {new_count} browser(s).")
+            else:
+                self.log(f"[PARALLEL] Target browser count set to {new_count}.")
+
     def _safe_ui_after(self, delay_ms, fn):
         root = getattr(self, "root", None)
         if root is None:
-            return
+            return None
         try:
-            root.after(delay_ms, fn)
+            return root.after(delay_ms, fn)
         except (RuntimeError, tk.TclError):
-            pass
+            return None
 
     def log(self, message):
         timestamp = time.strftime("%H:%M:%S")
@@ -1818,10 +2328,18 @@ class CProSuiteApp:
                 self.btn_deselect_all,
                 self.btn_select_pending,
                 self.btn_select_errors,
+                self.btn_reset_status,
                 self.btn_select_pdf_batch,
                 self.btn_remove_pdf_batch,
+                self.btn_add_acc,
+                self.btn_link_accs,
             ):
-                btn.config(state=state)
+                if btn is not None:
+                    btn.config(state=state)
+            for acc in getattr(self, "accounts", []) or []:
+                cmb = acc.get("cmb_link")
+                if cmb is not None:
+                    cmb.config(state="disabled" if running else "readonly")
             self.btn_stop.config(state=stop_state)
 
         self._safe_ui_after(0, _apply)
@@ -1929,6 +2447,7 @@ class CProSuiteApp:
             if self.tree.exists(iid):
                 self.tree.set(iid, "check", CHECKED_GLYPH if match else UNCHECKED_GLYPH)
         self._update_selection_summary()
+        self._save_check_state()
         self.log(f"Selected {count} row(s) from PDF batch '{target_src}'.")
 
     def on_remove_selected_pdf_batch(self):
@@ -1946,9 +2465,13 @@ class CProSuiteApp:
         self.cases_data = [r for r in self.cases_data if self._row_source_key(r) != target_src]
         removed = before - len(self.cases_data)
         self.pdf_batch_status.pop(target_src, None)
+        if hasattr(self, "report_excel_paths"):
+            self.report_excel_paths.pop(target_src, None)
+        if hasattr(self, "detailed_logs_by_source"):
+            self.detailed_logs_by_source.pop(target_src, None)
         self._selected_pdf_source = "ALL"
         self.refresh_table()
-        self._save_extracted_excel()
+        self._save_check_state()
         self.log(f"Removed PDF batch '{target_src}' ({removed} row(s)).")
 
     def _update_selection_summary(self):
@@ -1976,6 +2499,7 @@ class CProSuiteApp:
         for iid in self.tree.get_children():
             self.tree.set(iid, "check", glyph)
         self._update_selection_summary()
+        self._save_check_state()
 
     def _toggle_row_checkbox(self, idx):
         if not (0 <= idx < len(self.cases_data)):
@@ -1986,6 +2510,7 @@ class CProSuiteApp:
         if self.tree.exists(iid):
             self.tree.set(iid, "check", CHECKED_GLYPH if new_val else UNCHECKED_GLYPH)
         self._update_selection_summary()
+        self._save_check_state()
 
     def _toggle_all_checkboxes(self):
         if not self.cases_data:
@@ -2028,6 +2553,7 @@ class CProSuiteApp:
             if self.tree.exists(iid):
                 self.tree.set(iid, "check", CHECKED_GLYPH if target_val else UNCHECKED_GLYPH)
         self._update_selection_summary()
+        self._save_check_state()
         return "break"
 
     def on_select_all_rows(self):
@@ -2055,6 +2581,7 @@ class CProSuiteApp:
             if self.tree.exists(iid):
                 self.tree.set(iid, "check", CHECKED_GLYPH if checked else UNCHECKED_GLYPH)
         self._update_selection_summary()
+        self._save_check_state()
         self.log(f"Selected {len(matching)} '{target_status}' row(s) for C-PRO check.")
 
     def on_select_pending_rows(self):
@@ -2062,6 +2589,37 @@ class CProSuiteApp:
 
     def on_select_error_rows(self):
         self._select_rows_by_status("CHECK ERROR", "No Error Rows", "There are currently no CHECK ERROR rows in the queue.")
+
+    def on_reset_selected_status(self):
+        if self.is_running or not self.cases_data:
+            return
+        selected_indices = [i for i, row in enumerate(self.cases_data) if row.get("_checked", True)]
+        if not selected_indices:
+            messagebox.showwarning("No Rows Selected", "Please check (☑) at least one row to reset its status.", parent=self.root)
+            return
+        proceed = messagebox.askyesno(
+            "Reset Checking Condition",
+            f"Reset C-PRO checking status and cached section history for {len(selected_indices)} selected row(s) back to 'Pending'?",
+            parent=self.root,
+        )
+        if not proceed:
+            return
+        for i in selected_indices:
+            row = self.cases_data[i]
+            row["Availability Status"] = "Pending"
+            row["Found In Account(s)"] = "-"
+            row["Found In Section(s)"] = "-"
+            row["Billing Check"] = "-"
+            row["Upload Status"] = "-"
+            row["Extracted Invoice PDF"] = "-"
+            row["C-PRO Row Details"] = "-"
+            row["_checked_history"] = {}
+            row["_found_accounts"] = []
+            row["_found_sections"] = []
+            row["_found_details"] = []
+        self.refresh_table()
+        self._save_check_state()
+        self.log(f"[STATE] Reset checking condition for {len(selected_indices)} selected row(s) back to Pending.")
 
     def refresh_table(self, active_idx=None):
         def _rebuild():
@@ -2077,6 +2635,8 @@ class CProSuiteApp:
                     continue
                 status = row.get("Availability Status", "Pending")
                 checked = row.get("_checked", True)
+                clean_checks = self._count_clean_case_checks(row)
+                display_status = f"Pending ({clean_checks} chk)" if status == "Pending" and clean_checks > 0 else status
                 tag = ""
                 if i == active_idx:
                     tag = "CHECKING"
@@ -2105,7 +2665,7 @@ class CProSuiteApp:
                         row.get("Invoice Date", ""),
                         row.get("Invoice Amount", ""),
                         row.get("Invoice Pages", ""),
-                        status,
+                        display_status,
                         row.get("Found In Account(s)", "-"),
                         row.get("Billing Check", "-"),
                         row.get("Upload Status", "-"),
@@ -2159,6 +2719,46 @@ class CProSuiteApp:
         else:
             search_name = raw_search or full_name
 
+        raw_history = rec.get("_checked_history")
+        checked_history = {}
+        if isinstance(raw_history, dict):
+            for sec_name, sec_entries in raw_history.items():
+                if not isinstance(sec_entries, dict):
+                    continue
+                sec_clean = {}
+                for k_scope, entry in sec_entries.items():
+                    if isinstance(entry, dict) and entry.get("state"):
+                        sec_clean[str(k_scope)] = {
+                            "state": str(entry.get("state", "")),
+                            "by": str(entry.get("by", "")),
+                            "group": CProSuiteApp._normalize_link_group(entry.get("group", "")),
+                            "note": str(entry.get("note", "")),
+                            "ts": float(entry.get("ts", 0.0) or 0.0),
+                        }
+                if sec_clean:
+                    checked_history[str(sec_name)] = sec_clean
+
+        found_accounts = rec.get("_found_accounts")
+        if not isinstance(found_accounts, list):
+            acc_str = rec.get("Found In Account(s)", "").strip()
+            found_accounts = (
+                [a.strip() for a in acc_str.split(",") if a.strip()]
+                if acc_str and acc_str not in ("-", "None", "Check incomplete", "Login not verified")
+                else []
+            )
+        found_sections = rec.get("_found_sections")
+        if not isinstance(found_sections, list):
+            sec_str = rec.get("Found In Section(s)", "").strip()
+            found_sections = (
+                [s.strip() for s in sec_str.split(",") if s.strip()]
+                if sec_str and sec_str not in ("-", "None")
+                else []
+            )
+        found_details = rec.get("_found_details")
+        if not isinstance(found_details, list):
+            det_str = rec.get("C-PRO Row Details", "").strip()
+            found_details = [det_str] if det_str and det_str != "-" else []
+
         return {
             "Source File": src_file,
             "Source PDF Path": src_path,
@@ -2177,12 +2777,219 @@ class CProSuiteApp:
             "Upload Status": rec.get("Upload Status", "").strip() or "-",
             "Extracted Invoice PDF": rec.get("Extracted Invoice PDF", "").strip() or "-",
             "C-PRO Row Details": rec.get("C-PRO Row Details", "").strip() or "-",
-            "_checked": True,
+            "_checked": bool(rec.get("_checked", True)),
+            "_checked_history": checked_history,
+            "_found_accounts": list(found_accounts),
+            "_found_sections": list(found_sections),
+            "_found_details": list(found_details),
         }
 
-    def _auto_load_existing_excel(self):
+    def _get_state_save_lock(self):
+        lock = self.__dict__.get("_state_save_lock")
+        if lock is None:
+            lock = threading.Lock()
+            self.__dict__["_state_save_lock"] = lock
+        return lock
+
+    @staticmethod
+    def _clean_states_for_mode(verify_mode):
+        if verify_mode:
+            return ("NOT_FOUND", "MATCHED", "BILLING_MISMATCH")
+        return ("NOT_FOUND", "MATCHED", "MATCHED_AVAIL", "BILLING_MISMATCH")
+
+    @staticmethod
+    def _count_clean_case_checks(case):
+        hist = case.get("_checked_history") or {}
+        count = 0
+        for sec_entries in hist.values():
+            if not isinstance(sec_entries, dict):
+                continue
+            for entry in sec_entries.values():
+                if isinstance(entry, dict) and entry.get("state") in ("NOT_FOUND", "MATCHED", "MATCHED_AVAIL", "BILLING_MISMATCH"):
+                    count += 1
+        return count
+
+    def _get_case_section_history_entry(self, case, acc, section, active_accounts=None):
+        hist = case.get("_checked_history") or {}
+        sec_map = hist.get(section)
+        if not isinstance(sec_map, dict) or not sec_map:
+            return None
+        scope_key, group, peer_scope_keys, peer_usernames = self._get_scope_match_identity(acc, active_accounts)
+        matches = []
+        for k_scope, entry in sec_map.items():
+            if not isinstance(entry, dict) or not entry.get("state"):
+                continue
+            by_low = str(entry.get("by", "")).strip().casefold()
+            entry_grp = self._normalize_link_group(entry.get("group", "")).casefold()
+            if (
+                k_scope in peer_scope_keys
+                or (by_low and by_low in peer_usernames)
+                or (group and entry_grp == group.casefold())
+            ):
+                matches.append(entry)
+        if not matches:
+            return None
+        for m in matches:
+            if m.get("state") in ("MATCHED", "MATCHED_AVAIL", "BILLING_MISMATCH", "NOT_FOUND"):
+                return m
+        return matches[0]
+
+    def _record_case_section_history(self, case, acc, section, state, note="", active_accounts=None):
+        scope_key, group, _peer_scopes, _peer_users = self._get_scope_match_identity(acc, active_accounts)
+        hist = case.setdefault("_checked_history", {})
+        sec_map = hist.setdefault(section, {})
+        sec_map[scope_key] = {
+            "state": state,
+            "by": str(acc.get("username", "")).strip(),
+            "group": group,
+            "note": str(note or ""),
+            "ts": time.time(),
+        }
+
+    def _save_check_state(self):
+        state_path = getattr(self, "check_state_path", None)
+        if not state_path:
+            return
+        with self._get_state_save_lock():
+            cases_lock = getattr(self, "_cases_lock", None)
+            if cases_lock is not None:
+                cases_lock.acquire()
+            try:
+                cases_snapshot = []
+                for row in getattr(self, "cases_data", []) or []:
+                    row_copy = dict(row)
+                    if isinstance(row.get("_checked_history"), dict):
+                        row_copy["_checked_history"] = {
+                            sec: {sk: dict(ent) for sk, ent in smap.items()}
+                            for sec, smap in row["_checked_history"].items()
+                            if isinstance(smap, dict)
+                        }
+                    else:
+                        row_copy["_checked_history"] = {}
+                    row_copy["_found_accounts"] = list(row.get("_found_accounts", []) or [])
+                    row_copy["_found_sections"] = list(row.get("_found_sections", []) or [])
+                    row_copy["_found_details"] = list(row.get("_found_details", []) or [])
+                    cases_snapshot.append(row_copy)
+
+                def _var_val(attr, default=None):
+                    v = getattr(self, attr, None)
+                    return v.get() if hasattr(v, "get") else default
+
+                payload = {
+                    "version": 1,
+                    "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "cases": cases_snapshot,
+                    "pdf_batch_status": dict(getattr(self, "pdf_batch_status", {}) or {}),
+                    "report_excel_paths": dict(getattr(self, "report_excel_paths", {}) or {}),
+                    "detailed_logs_by_source": {
+                        src: list(entries)
+                        for src, entries in (getattr(self, "detailed_logs_by_source", {}) or {}).items()
+                    },
+                    "account_hit_counts": dict(getattr(self, "account_hit_counts", {}) or {}),
+                    "account_prefix_affinity": dict(getattr(self, "account_prefix_affinity", {}) or {}),
+                    "custom_link_groups": list(getattr(self, "_custom_link_groups", []) or []),
+                    "ui_settings": {
+                        "sec_in_progress": bool(_var_val("sec_in_progress", True)),
+                        "sec_withhold": bool(_var_val("sec_withhold", True)),
+                        "sec_withdrawn": bool(_var_val("sec_withdrawn", True)),
+                        "search_mode": str(_var_val("search_mode", "ACCOUNT_THEN_NAME") or "ACCOUNT_THEN_NAME"),
+                        "verify_and_upload": bool(_var_val("verify_and_upload", True)),
+                        "auto_run_after_upload": bool(_var_val("auto_run_after_upload", False)),
+                        "watch_scanned_folder": bool(_var_val("watch_scanned_folder", False)),
+                        "auto_archive_completed_pdfs": bool(_var_val("auto_archive_completed_pdfs", False)),
+                        "show_browser": bool(_var_val("show_browser", True)),
+                        "target_browsers": int(self.get_target_browser_count()),
+                    },
+                }
+            finally:
+                if cases_lock is not None:
+                    cases_lock.release()
+
+            try:
+                parent_dir = os.path.dirname(os.path.abspath(state_path))
+                os.makedirs(parent_dir, exist_ok=True)
+                tmp_path = f"{state_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                os.replace(tmp_path, state_path)
+            except Exception as e:
+                self.log(f"Notice: Could not save checking state: {e}")
+
+    def _load_check_state_or_legacy(self):
+        state_path = getattr(self, "check_state_path", None)
+        if state_path and os.path.isfile(state_path):
+            try:
+                with open(state_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                if isinstance(state, dict):
+                    loaded_cases = state.get("cases", [])
+                    if isinstance(loaded_cases, list):
+                        for rec in loaded_cases:
+                            if isinstance(rec, dict):
+                                self.cases_data.append(
+                                    self._normalize_imported_row(rec, rec.get("Source File", ""))
+                                )
+                    batch_st = state.get("pdf_batch_status")
+                    if isinstance(batch_st, dict):
+                        for k, v in batch_st.items():
+                            self.pdf_batch_status[str(k)] = "Partial" if v == "Running" else str(v)
+                    rep_paths = state.get("report_excel_paths")
+                    if isinstance(rep_paths, dict):
+                        self.report_excel_paths.update({str(k): str(v) for k, v in rep_paths.items()})
+                    det_logs = state.get("detailed_logs_by_source")
+                    if isinstance(det_logs, dict):
+                        self.detailed_logs_by_source.update(
+                            {str(k): list(v) for k, v in det_logs.items() if isinstance(v, list)}
+                        )
+                    hit_cnts = state.get("account_hit_counts")
+                    if isinstance(hit_cnts, dict):
+                        self.account_hit_counts.update({str(k): int(v) for k, v in hit_cnts.items()})
+                    pref_aff = state.get("account_prefix_affinity")
+                    if isinstance(pref_aff, dict):
+                        self.account_prefix_affinity.update({str(k): str(v) for k, v in pref_aff.items()})
+                    custom_grps = state.get("custom_link_groups")
+                    if isinstance(custom_grps, list):
+                        for g in custom_grps:
+                            norm = self._normalize_link_group(g)
+                            if norm and norm.casefold() not in {x.casefold() for x in self._get_available_link_group_choices()}:
+                                self._custom_link_groups.append(norm)
+                        self._refresh_all_link_comboboxes()
+                    ui_cfg = state.get("ui_settings")
+                    if isinstance(ui_cfg, dict):
+                        for attr in (
+                            "sec_in_progress",
+                            "sec_withhold",
+                            "sec_withdrawn",
+                            "search_mode",
+                            "verify_and_upload",
+                            "auto_run_after_upload",
+                            "watch_scanned_folder",
+                            "auto_archive_completed_pdfs",
+                            "show_browser",
+                        ):
+                            if attr in ui_cfg and hasattr(self, attr):
+                                var = getattr(self, attr)
+                                if hasattr(var, "set"):
+                                    var.set(ui_cfg[attr])
+                        if "target_browsers" in ui_cfg:
+                            try:
+                                self.set_target_browser_count(int(ui_cfg["target_browsers"]))
+                            except Exception:
+                                pass
+                    self.refresh_table()
+                    done_cnt = sum(1 for c in self.cases_data if c.get("Availability Status") in ("COMPLETE", "AVAILABLE"))
+                    chk_cnt = sum(self._count_clean_case_checks(c) for c in self.cases_data)
+                    self.log(
+                        f"Restored {len(self.cases_data)} queued case(s) "
+                        f"({done_cnt} completed, {chk_cnt} saved section check(s)) from '{state_path}'."
+                    )
+                    return
+            except Exception as e:
+                self.log(f"Could not load saved check state '{state_path}': {e}")
+
+        # Optional one-time read-only migration if an older extracted_cases.xlsx already exists on disk
         candidates = [
-            EXTRACTED_EXCEL,
+            os.path.join(OUTPUT_DIR, "extracted_cases.xlsx"),
             os.path.join(os.getcwd(), "extracted_cases.xlsx"),
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "extracted_cases.xlsx"),
         ]
@@ -2194,10 +3001,31 @@ class CProSuiteApp:
             for rec in df.to_dict("records"):
                 self.cases_data.append(self._normalize_imported_row(rec, os.path.basename(source_path)))
             self.refresh_table()
-            self.last_extracted_path = source_path
-            self.log(f"Loaded {len(self.cases_data)} existing case(s) from '{source_path}'.")
+            self.log(f"Loaded {len(self.cases_data)} legacy case(s) read-only from '{source_path}'.")
         except Exception as e:
-            self.log(f"Could not auto-load '{source_path}': {e}")
+            self.log(f"Could not read legacy file '{source_path}': {e}")
+
+    def on_app_close(self):
+        if self.is_running:
+            self.stop_requested = True
+            cond = self._get_pool_cond()
+            with cond:
+                cond.notify_all()
+        try:
+            aid = getattr(self, "_watch_after_id", None)
+            if aid is not None and getattr(self, "root", None) is not None:
+                self.root.after_cancel(aid)
+        except Exception:
+            pass
+        try:
+            self._save_accounts_config()
+        except Exception:
+            pass
+        try:
+            self._save_check_state()
+        except Exception:
+            pass
+        self.root.destroy()
 
     @staticmethod
     def _directory_is_writable(folder):
@@ -2251,73 +3079,9 @@ class CProSuiteApp:
         safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw).strip(" ._")
         return safe or "manual_cases"
 
-    def _get_extracted_excel_path(self, source_file):
-        stem = self._sanitize_pdf_stem(source_file)
-        return os.path.join(OUTPUT_DIR, f"extracted_cases_{stem}.xlsx")
-
     def _get_report_excel_path(self, source_file):
         stem = self._sanitize_pdf_stem(source_file)
         return os.path.join(OUTPUT_DIR, f"cpro_availability_report_{stem}.xlsx")
-
-    @staticmethod
-    def _write_cases_dataframe_to_excel(df_subset, export_cols, path):
-        with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            df_subset[export_cols].to_excel(writer, index=False, sheet_name="To_Check")
-            ws = writer.sheets["To_Check"]
-            for col in ws.columns:
-                max_len = max(len(str(cell.value or "")) for cell in col) + 4
-                ws.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
-
-    def _save_extracted_excel(self, target_source_file=None):
-        if not self.cases_data:
-            return None
-        desired_cols = [
-            "Source File", "Source PDF Path", "Invoice Pages", "Invoice No",
-            "Invoice Date", "Invoice Amount", "Account No", "Alt Account No",
-            "Search Name", "Full Borrower Name",
-        ]
-        df_all = pd.DataFrame(self.cases_data)
-        export_cols = [c for c in desired_cols if c in df_all.columns]
-
-        sources_to_save = (
-            [target_source_file]
-            if target_source_file
-            else self._get_ordered_source_files()
-        )
-        latest_per_pdf_path = None
-        for src_file in sources_to_save:
-            src_rows = [r for r in self.cases_data if self._row_source_key(r) == src_file]
-            if not src_rows:
-                continue
-            df_src = pd.DataFrame(src_rows)
-            src_cols = [c for c in desired_cols if c in df_src.columns]
-            per_pdf_pref = self._get_extracted_excel_path(src_file)
-            try:
-                saved_per_pdf = self._write_with_fallback(
-                    per_pdf_pref,
-                    lambda p, d=df_src, cols=src_cols: self._write_cases_dataframe_to_excel(d, cols, p),
-                    f"extracted cases for {src_file}",
-                )
-                self.extracted_excel_paths[src_file] = saved_per_pdf
-                self.last_extracted_path = saved_per_pdf
-                latest_per_pdf_path = saved_per_pdf
-            except Exception as e:
-                self.log(f"[ERROR] Could not save extracted cases for '{src_file}': {e}")
-
-        # Keep master extracted_cases.xlsx updated so all queued PDFs reload on next startup
-        try:
-            master_saved = self._write_with_fallback(
-                EXTRACTED_EXCEL,
-                lambda p: self._write_cases_dataframe_to_excel(df_all, export_cols, p),
-                "master extracted cases queue",
-            )
-            if latest_per_pdf_path is None:
-                self.last_extracted_path = master_saved
-                latest_per_pdf_path = master_saved
-        except Exception as e:
-            self.log(f"[ERROR] Could not save master extracted cases queue: {e}")
-
-        return latest_per_pdf_path
 
     def _save_report_excel_for_rows(self, rows_subset, detailed_subset, preferred_path, description):
         summary_rows = [
@@ -2358,14 +3122,6 @@ class CProSuiteApp:
                         sheet.column_dimensions[col[0].column_letter].width = min(max(max_len, 14), 50)
 
         return self._write_with_fallback(preferred_path, _write_report, description)
-
-    def _open_selected_extracted_excel(self):
-        if self._selected_pdf_source != "ALL":
-            cand = self.extracted_excel_paths.get(self._selected_pdf_source) or self._get_extracted_excel_path(self._selected_pdf_source)
-            if os.path.exists(cand):
-                self._open_file(cand)
-                return
-        self._open_file(getattr(self, "last_extracted_path", EXTRACTED_EXCEL))
 
     def _open_selected_report_excel(self):
         if self._selected_pdf_source != "ALL":
@@ -2421,9 +3177,8 @@ class CProSuiteApp:
                 self.log(f"  -> p.{case.get('Invoice Pages') or '?'} | {inv_info} | {case['Account No']} | {case['Search Name']}")
             self.pdf_batch_status[fname] = "Queued"
 
-        saved_per_pdf = self._save_extracted_excel(target_source_file=fname)
-        if saved_per_pdf:
-            self.log(f"  [EXCEL] Saved {len(extracted_cases)} extracted record(s) for '{fname}' -> '{saved_per_pdf}'")
+        self._save_check_state()
+        self.log(f"  [QUEUE] Saved {len(extracted_cases)} extracted record(s) for '{fname}' to session queue.")
         self.refresh_table()
         return extracted_cases
 
@@ -2515,7 +3270,7 @@ class CProSuiteApp:
                 if not (pipeline_auto_run and self._queued_pdf_paths):
                     num_batches = len(self._get_ordered_source_files())
                     self.log(
-                        f"Extraction complete: {extracted_files_count} PDF file(s) scanned into individual Excel files "
+                        f"Extraction complete: {extracted_files_count} PDF file(s) scanned and queued "
                         f"({num_batches} total PDF batch(es) in queue, {len(self.cases_data)} total row(s))."
                     )
                 self.set_status("Ready", bg="#E8E8ED", fg=THEME["text"])
@@ -2569,7 +3324,7 @@ class CProSuiteApp:
         except Exception as e:
             self.log(f"[WATCHER] Folder poll error: {e}")
         finally:
-            self._safe_ui_after(4000, self._poll_watched_folder)
+            self._watch_after_id = self._safe_ui_after(4000, self._poll_watched_folder)
 
     def _archive_completed_pdf_if_enabled(self, source_file, batch_indices):
         if not self.auto_archive_completed_pdfs.get() or not batch_indices:
@@ -2631,7 +3386,7 @@ class CProSuiteApp:
             for rec in df.to_dict("records"):
                 self.cases_data.append(self._normalize_imported_row(rec, fname))
             self.refresh_table()
-            self._save_extracted_excel()
+            self._save_check_state()
             self.log(f"Imported {len(df)} row(s) from {fname}.")
         except Exception as e:
             messagebox.showerror("Import Error", str(e))
@@ -2757,7 +3512,7 @@ class CProSuiteApp:
             })
             self.cases_data.append(rec)
             self.refresh_table()
-            self._save_extracted_excel()
+            self._save_check_state()
             dialog.destroy()
 
         self._open_case_form_dialog("Add Case Manually", specs, "Add to Queue", _save)
@@ -2787,6 +3542,12 @@ class CProSuiteApp:
         ]
 
         def _update(values, dialog):
+            old_key = (
+                row_data.get("Account No", ""),
+                row_data.get("Search Name", ""),
+                row_data.get("Invoice Date", ""),
+                row_data.get("Invoice Amount", ""),
+            )
             row_data["Account No"] = values["Account No"]
             row_data["Search Name"] = values["Search Name"]
             row_data["Full Borrower Name"] = values["Search Name"]
@@ -2800,8 +3561,27 @@ class CProSuiteApp:
             if row_data["Source PDF Path"]:
                 row_data["Source File"] = os.path.basename(row_data["Source PDF Path"])
             row_data["Invoice Pages"] = values["Invoice Pages"]
+            new_key = (
+                row_data.get("Account No", ""),
+                row_data.get("Search Name", ""),
+                row_data.get("Invoice Date", ""),
+                row_data.get("Invoice Amount", ""),
+            )
+            if new_key != old_key:
+                row_data["Availability Status"] = "Pending"
+                row_data["Found In Account(s)"] = "-"
+                row_data["Found In Section(s)"] = "-"
+                row_data["Billing Check"] = "-"
+                row_data["Upload Status"] = "-"
+                row_data["Extracted Invoice PDF"] = "-"
+                row_data["C-PRO Row Details"] = "-"
+                row_data["_checked_history"] = {}
+                row_data["_found_accounts"] = []
+                row_data["_found_sections"] = []
+                row_data["_found_details"] = []
+                self.log(f"[STATE] Row #{idx + 1} search/billing field changed — reset checking condition to Pending.")
             self.refresh_table()
-            self._save_extracted_excel()
+            self._save_check_state()
             dialog.destroy()
 
         self._open_case_form_dialog(f"Edit Row #{idx + 1}", specs, "Save Changes", _update)
@@ -2816,7 +3596,7 @@ class CProSuiteApp:
         for i in indices:
             del self.cases_data[i]
         self.refresh_table()
-        self._save_extracted_excel()
+        self._save_check_state()
 
     def on_clear_list(self):
         if self.is_running or not self.cases_data:
@@ -2824,15 +3604,24 @@ class CProSuiteApp:
         if messagebox.askyesno("Clear Queue", "Remove all cases and queued PDF batches from the current list?"):
             self.cases_data.clear()
             self.pdf_batch_status.clear()
+            if hasattr(self, "report_excel_paths"):
+                self.report_excel_paths.clear()
+            if hasattr(self, "detailed_logs_by_source"):
+                self.detailed_logs_by_source.clear()
             self._selected_pdf_source = "ALL"
             with self._pdf_queue_lock:
                 self._queued_pdf_paths.clear()
             self.refresh_table()
+            self._save_check_state()
 
     def on_stop_automation(self):
         if self.is_running:
             self.stop_requested = True
-            self.log("[!] Stop requested by user. Finishing current action...")
+            cond = self._get_pool_cond()
+            with cond:
+                cond.notify_all()
+            self._save_check_state()
+            self.log("[!] Stop requested by user. Finishing current action & preserving progress...")
             self.set_status("Stopping...", bg="#FFF2F2", fg=THEME["red"])
 
     def on_start_cpro_check(self):
@@ -2871,6 +3660,7 @@ class CProSuiteApp:
                     return
 
         active_accounts = []
+        seen_usernames = set()
         for idx, acc in enumerate(self.accounts, start=1):
             if acc["enabled"].get():
                 username = acc["user"].get().strip()
@@ -2878,10 +3668,18 @@ class CProSuiteApp:
                 if not username:
                     messagebox.showwarning("Missing Username", f"Account #{idx} is enabled but has no username.\n\nPlease enter a username or uncheck/remove it.", parent=self.root)
                     return
+                ukey = username.casefold()
+                if ukey in seen_usernames:
+                    self.log(f"[!] Skipping duplicate enabled account '{username}' (Account #{idx}) to avoid parallel kickouts.")
+                    continue
+                seen_usernames.add(ukey)
+                lv = acc.get("link_group")
+                lval = self._normalize_link_group(lv.get() if hasattr(lv, "get") else lv)
                 active_accounts.append({
                     "username": username,
                     "password": password,
                     "password_var": acc["pwd"],
+                    "link_group": lval,
                 })
 
         if not active_accounts:
@@ -2897,6 +3695,15 @@ class CProSuiteApp:
                 acc["password_var"].set(acc["password"])
 
         self._save_accounts_config()
+        self._save_check_state()
+
+        link_summary = {}
+        for a in active_accounts:
+            if a.get("link_group"):
+                link_summary.setdefault(a["link_group"], []).append(a["username"])
+        if link_summary:
+            desc = " | ".join(f"{g}: {', '.join(us)}" for g, us in link_summary.items())
+            self.log(f"[LINK] Active Shared DB Link Groups -> {desc}")
 
         active_sections = []
         if self.sec_in_progress.get():
@@ -3264,30 +4071,31 @@ class CProSuiteApp:
         self._wait_for_section_table(page, section, timeout_ms=45000, action=_click_tab, fast_restore=fast_restore)
 
     def _prompt_for_correct_password(self, acc, reason):
-        result = {"password": None}
-        ready = threading.Event()
+        with self._get_auth_prompt_lock():
+            result = {"password": None}
+            ready = threading.Event()
 
-        def ask():
-            try:
-                result["password"] = simpledialog.askstring(
-                    "C-PRO Password Rejected",
-                    f"C-PRO rejected the password for {acc['username']}.\n{reason}\n\nEnter correct password:",
-                    show="•",
-                    parent=self.root,
-                )
-            finally:
-                ready.set()
+            def ask():
+                try:
+                    result["password"] = simpledialog.askstring(
+                        "C-PRO Password Rejected",
+                        f"C-PRO rejected the password for {acc['username']}.\n{reason}\n\nEnter correct password:",
+                        show="•",
+                        parent=self.root,
+                    )
+                finally:
+                    ready.set()
 
-        self._safe_ui_after(0, ask)
-        while not ready.wait(0.2):
-            if self.stop_requested:
-                return None
-        password = (result["password"] or "").strip()
-        if password:
-            acc["password"] = password
-            if acc.get("password_var") is not None:
-                self._safe_ui_after(0, lambda v=acc["password_var"], p=password: v.set(p))
-        return password or None
+            self._safe_ui_after(0, ask)
+            while not ready.wait(0.2):
+                if self.stop_requested:
+                    return None
+            password = (result["password"] or "").strip()
+            if password:
+                acc["password"] = password
+                if acc.get("password_var") is not None:
+                    self._safe_ui_after(0, lambda v=acc["password_var"], p=password: v.set(p))
+            return password or None
 
     @staticmethod
     def _login_rejection_text(page):
@@ -4783,10 +5591,32 @@ class CProSuiteApp:
         return status == "AVAILABLE"
 
     @staticmethod
-    def _mark_case_error(case, checked_pairs, error_reasons, acc_idx, username, section, reason):
+    def _case_has_unresolved_history_error(case):
+        hist = case.get("_checked_history") or {}
+        for sec_entries in hist.values():
+            if not isinstance(sec_entries, dict):
+                continue
+            for entry in sec_entries.values():
+                if isinstance(entry, dict) and entry.get("state") == "ERROR":
+                    return True
+        return False
+
+    @staticmethod
+    def _case_has_history_mismatch(case):
+        hist = case.get("_checked_history") or {}
+        for sec_entries in hist.values():
+            if not isinstance(sec_entries, dict):
+                continue
+            for entry in sec_entries.values():
+                if isinstance(entry, dict) and entry.get("state") == "BILLING_MISMATCH":
+                    return True
+        return False
+
+    @staticmethod
+    def _mark_case_error(case, checked_pairs, error_reasons, scope_key, username, section, reason):
         if case.get("Availability Status") in ("AVAILABLE", "COMPLETE"):
             return
-        checked_pairs[(acc_idx, section)] = "ERROR"
+        checked_pairs[(scope_key, section)] = "ERROR"
         error_reasons.append((username, section, reason))
         failed_locs = ", ".join(dict.fromkeys(f"{u}: {s}" for u, s, _ in error_reasons))
         case["Availability Status"] = "CHECK ERROR"
@@ -4795,25 +5625,25 @@ class CProSuiteApp:
         case["C-PRO Row Details"] = reason
 
     @staticmethod
-    def _resolve_case_after_clean_pair(case, checked_pairs, error_reasons, acc_idx, username, section, active_accounts, active_sections, pair_state="NOT_FOUND", mismatch_note=""):
+    def _resolve_case_after_clean_pair(case, checked_pairs, error_reasons, scope_key, username, section, active_scopes, active_sections, pair_state="NOT_FOUND", mismatch_note=""):
         if case.get("Availability Status") in ("AVAILABLE", "COMPLETE", "BILLING MATCHED (No PDF)"):
             return
-        checked_pairs[(acc_idx, section)] = pair_state
+        checked_pairs[(scope_key, section)] = pair_state
         if mismatch_note and pair_state == "BILLING_MISMATCH":
             case["Billing Check"] = f"{username}: {section} -> {mismatch_note}"
-        if error_reasons:
+        if error_reasons or CProSuiteApp._case_has_unresolved_history_error(case):
             return
         all_checked = all(
-            checked_pairs.get((a_i, sec)) in ("NOT_FOUND", "BILLING_MISMATCH")
-            for a_i in range(len(active_accounts))
+            checked_pairs.get((sc, sec)) in ("NOT_FOUND", "BILLING_MISMATCH")
+            for sc in active_scopes
             for sec in active_sections
         )
         if all_checked:
             had_mismatch = any(
-                checked_pairs.get((a_i, sec)) == "BILLING_MISMATCH"
-                for a_i in range(len(active_accounts))
+                checked_pairs.get((sc, sec)) == "BILLING_MISMATCH"
+                for sc in active_scopes
                 for sec in active_sections
-            )
+            ) or CProSuiteApp._case_has_history_mismatch(case)
             if had_mismatch:
                 case["Availability Status"] = "NONE (Billing Mismatch)"
                 case["Found In Account(s)"] = "None"
@@ -4826,6 +5656,56 @@ class CProSuiteApp:
                 case["Billing Check"] = "-"
                 case["Upload Status"] = "-"
                 case["C-PRO Row Details"] = "-"
+
+    def _hydrate_pass_tracking(self, ordered_accounts, active_sections, pass_indices, found_tracker, verify_mode):
+        """Restore prior checking condition and link-group coverage instead of wiping progress on resume/switch."""
+        active_scopes = list(dict.fromkeys(self._get_account_db_scope(a) for a in ordered_accounts))
+        checked_pairs = {idx: {} for idx in pass_indices}
+        error_reasons = {idx: [] for idx in pass_indices}
+        pre_done_steps = set()
+        clean_states = self._clean_states_for_mode(verify_mode)
+
+        for idx in pass_indices:
+            case = self.cases_data[idx]
+            existing_accs = list(case.get("_found_accounts") or [])
+            if not existing_accs:
+                raw_fa = (case.get("Found In Account(s)") or "").strip()
+                if raw_fa and raw_fa not in ("-", "None", "Check incomplete", "Login not verified"):
+                    existing_accs = [a.strip() for a in raw_fa.split(",") if a.strip()]
+            existing_secs = list(case.get("_found_sections") or [])
+            if not existing_secs:
+                raw_fs = (case.get("Found In Section(s)") or "").strip()
+                if raw_fs and raw_fs not in ("-", "None"):
+                    existing_secs = [s.strip() for s in raw_fs.split(",") if s.strip()]
+            existing_dets = list(case.get("_found_details") or [])
+            if not existing_dets:
+                raw_det = (case.get("C-PRO Row Details") or "").strip()
+                if raw_det and raw_det != "-" and (existing_accs or case.get("Availability Status") in ("AVAILABLE", "COMPLETE", "BILLING MATCHED (No PDF)")):
+                    existing_dets = [raw_det]
+
+            found_tracker[idx] = {
+                "accounts": existing_accs,
+                "sections": existing_secs,
+                "details": existing_dets,
+            }
+            if not (case.get("Availability Status") or "").strip():
+                case["Availability Status"] = "Pending"
+            for field in ("Found In Account(s)", "Found In Section(s)", "Billing Check", "Upload Status", "Extracted Invoice PDF", "C-PRO Row Details"):
+                if not (case.get(field) or "").strip():
+                    case[field] = "-"
+
+            done_case = self._is_case_done(case, verify_mode)
+            for acc in ordered_accounts:
+                sc = self._get_account_db_scope(acc)
+                for sec in active_sections:
+                    if (sc, sec) not in checked_pairs[idx]:
+                        hist_entry = self._get_case_section_history_entry(case, acc, sec, ordered_accounts)
+                        if hist_entry and hist_entry.get("state") in clean_states:
+                            checked_pairs[idx][(sc, sec)] = hist_entry["state"]
+                    if done_case or checked_pairs[idx].get((sc, sec)) in clean_states:
+                        pre_done_steps.add((idx, sc, sec))
+
+        return active_scopes, checked_pairs, error_reasons, pre_done_steps
 
     def _order_accounts_by_affinity(self, active_accounts, pass_indices):
         """Order C-PRO accounts by learned hit affinity for the current batch (ties preserve original order)."""
@@ -4846,176 +5726,267 @@ class CProSuiteApp:
         scored.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in scored]
 
-    def _run_check_pass(self, browser, active_accounts, active_sections, pass_indices, found_tracker, detailed_log, mode, verify_mode, round_label, session_pool=None):
-        ordered_accounts = self._order_accounts_by_affinity(active_accounts, pass_indices)
-        checked_pairs = {idx: {} for idx in pass_indices}
-        error_reasons = {idx: [] for idx in pass_indices}
-        for idx in pass_indices:
-            found_tracker[idx] = {"accounts": [], "sections": [], "details": []}
-            case = self.cases_data[idx]
-            case["Availability Status"] = "Pending"
-            case["Found In Account(s)"] = "-"
-            case["Found In Section(s)"] = "-"
-            case["Billing Check"] = "-"
-            case["Upload Status"] = "-"
-            case["Extracted Invoice PDF"] = "-"
-            case["C-PRO Row Details"] = "-"
-        self.refresh_table()
+    @staticmethod
+    def _launch_browser_for_slot(pw, headless, slot_id=0, multi_window=False):
+        launch_kwargs = {"headless": headless, "slow_mo": 20}
+        if not headless and (multi_window or slot_id > 0):
+            positions = ((0, 0), (960, 0), (0, 120), (960, 120))
+            wx, wy = positions[slot_id % len(positions)]
+            launch_kwargs["args"] = ["--window-size=960,900", f"--window-position={wx},{wy}"]
+        return pw.chromium.launch(**launch_kwargs)
 
-        total_steps = len(ordered_accounts) * len(active_sections) * len(pass_indices)
-        completed_steps = 0
-        self.set_progress(0, total_steps)
+    def _run_account_in_pass(
+        self,
+        browser,
+        acc_idx,
+        acc,
+        ordered_accounts,
+        active_sections,
+        pass_indices,
+        checked_pairs,
+        error_reasons,
+        found_tracker,
+        detailed_log,
+        mode,
+        verify_mode,
+        round_label,
+        session_pool=None,
+        state_lock=None,
+        case_locks=None,
+        progress_state=None,
+        slot_id=0,
+        should_yield_cb=None,
+        active_scopes=None,
+        in_flight_scope_claims=None,
+    ):
+        """Process a single C-PRO account across active_sections; returns True if yielded early on scale-down."""
+        if state_lock is None:
+            state_lock = threading.Lock()
+        if progress_state is None:
+            progress_state = {"done_steps": set()}
+        if active_scopes is None:
+            active_scopes = list(dict.fromkeys(self._get_account_db_scope(a) for a in ordered_accounts))
+        scope_key = self._get_account_db_scope(acc)
+        link_group = self._normalize_link_group(acc.get("link_group", ""))
+        clean_states = self._clean_states_for_mode(verify_mode)
+        total_steps = max(1, len(active_scopes) * len(active_sections) * len(pass_indices))
+        username = acc["username"]
+        worker_token = (slot_id, threading.get_ident(), acc_idx)
+        browser_tag = f"[B{slot_id + 1}] " if slot_id > 0 or self.get_target_browser_count() > 1 else ""
 
         def _all_done():
-            return all(self._is_case_done(self.cases_data[i], verify_mode) for i in pass_indices)
+            with state_lock:
+                return all(self._is_case_done(self.cases_data[i], verify_mode) for i in pass_indices)
 
-        def _mark_sections_error(acc_idx, username, sections_slice, reason, log_details=True):
-            for idx in pass_indices:
-                case = self.cases_data[idx]
-                if self._is_case_done(case, verify_mode):
-                    continue
-                acc_no = case.get("Account No", "").strip()
-                search_name = (case.get("Search Name") or case.get("Full Borrower Name") or "").strip()
-                for sec in sections_slice:
-                    if checked_pairs[idx].get((acc_idx, sec)) in ("NOT_FOUND", "MATCHED", "BILLING_MISMATCH"):
+        def _mark_step_done(case_idx, sec):
+            with state_lock:
+                done_set = progress_state.setdefault("done_steps", set())
+                done_set.add((case_idx, scope_key, sec))
+                done_count = len(done_set)
+            self.set_progress(min(done_count, total_steps), total_steps)
+
+        def _mark_sections_error(sections_slice, reason, log_details=True):
+            with state_lock:
+                for idx in pass_indices:
+                    case = self.cases_data[idx]
+                    if self._is_case_done(case, verify_mode):
                         continue
-                    self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, sec, reason)
-                    if log_details:
-                        detailed_log.append({
-                            "Invoice No": case.get("Invoice No", ""),
-                            "Account No": acc_no,
-                            "Search Name": search_name,
-                            "C-PRO Account": username,
-                            "Login Used": username,
-                            "Section": sec,
-                            "Status": "CHECK ERROR",
-                            "Matched By": "-",
-                            "Billing Check": "-",
-                            "Upload Status": "-",
-                            "C-PRO Row Details": reason,
-                            "Round": round_label,
-                        })
-
-        for acc_idx, acc in enumerate(ordered_accounts):
-            if self.stop_requested:
-                break
-            if _all_done():
-                completed_steps = total_steps
-                self.set_progress(completed_steps, total_steps)
-                break
-
-            username = acc["username"]
-            self.log(f"=== [{round_label}] Starting Account: {username} ===")
-
-            reused_session = False
-            context = None
-            page = None
-            if session_pool is not None and username in session_pool:
-                sess = session_pool[username]
-                try:
-                    if sess.get("page") is not None and not sess["page"].is_closed():
-                        context = sess["context"]
-                        page = sess["page"]
-                        reused_session = True
-                except Exception:
-                    context = None
-                    page = None
-
-            if not reused_session:
-                context = browser.new_context()
-                page = context.new_page()
-                self._install_session_timeout_handler(page)
-                if session_pool is not None:
-                    session_pool[username] = {"context": context, "page": page}
-
-            current_sec_idx = 0
-            current_section = active_sections[0] if active_sections else "(not selected)"
-
-            try:
-                if reused_session:
-                    if (
-                        self._is_kicked_or_unauthorized(page)
-                        or self._is_on_case_details(page)
-                        or "/case-listing" not in page.url.lower()
-                    ):
-                        self.log(f"[SESSION] Pooled session for {username} needs restore; re-authenticating...")
-                        self._login_and_restore_section(page, acc, section=None)
-                    else:
-                        self.log(f"[SESSION] Reusing active authenticated session for {username}.")
-                else:
-                    self._login_and_restore_section(page, acc, section=None)
-
-                for sec_idx, section in enumerate(active_sections):
-                    if self.stop_requested:
-                        break
-                    if _all_done():
-                        completed_steps = total_steps
-                        self.set_progress(completed_steps, total_steps)
-                        break
-
-                    current_sec_idx = sec_idx
-                    current_section = section
-                    self.log(f"[{username}] Switching to section: {section}")
-
-                    section_loaded = False
-                    last_section_err = None
-                    for sec_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
-                        if self.stop_requested:
-                            break
-                        try:
-                            needs_restore = (
-                                sec_attempt > 1
-                                or self._is_kicked_or_unauthorized(page)
-                                or self._is_on_case_details(page)
-                                or "/case-listing" not in page.url.lower()
-                            )
-                            if needs_restore:
-                                self._login_and_restore_section(page, acc, section=section)
-                            else:
-                                self._switch_section_and_wait(page, section)
-                            section_loaded = True
-                            break
-                        except InvalidCredentialsError as sec_auth_err:
-                            if self._is_fatal_auth_error(sec_auth_err):
-                                raise
-                            last_section_err = sec_auth_err
-                            self.log(
-                                f"[!] Session expired/kicked switching to '{section}' "
-                                f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}): {sec_auth_err}. Re-logging..."
-                            )
-                            page.wait_for_timeout(800)
-                        except Exception as section_error:
-                            if self.stop_requested:
-                                break
-                            last_section_err = section_error
-                            self.log(
-                                f"[!] Section '{section}' failed to load "
-                                f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}: {section_error}). Re-authenticating & retrying..."
-                            )
-                            page.wait_for_timeout(800)
-
-                    if self.stop_requested:
-                        break
-                    if not section_loaded:
-                        err_msg = f"Could not load the {section} section table after {MAX_RETRIES_ON_KICKOUT} attempt(s): {last_section_err}"
-                        self.log(f"[ERROR] [{username}] {err_msg}")
-                        _mark_sections_error(acc_idx, username, [section], err_msg)
-                        completed_steps = (acc_idx * len(active_sections) + sec_idx + 1) * len(pass_indices)
-                        self.set_progress(completed_steps, total_steps)
-                        self.refresh_table()
-                        continue
-
-                    for idx in pass_indices:
-                        if self.stop_requested:
-                            break
-                        case = self.cases_data[idx]
-
-                        if self._is_case_done(case, verify_mode):
-                            completed_steps += 1
-                            self.set_progress(completed_steps, total_steps)
+                    acc_no = case.get("Account No", "").strip()
+                    search_name = (case.get("Search Name") or case.get("Full Borrower Name") or "").strip()
+                    for sec in sections_slice:
+                        if checked_pairs[idx].get((scope_key, sec)) in clean_states:
                             continue
+                        if in_flight_scope_claims is not None:
+                            owner = in_flight_scope_claims.get((idx, scope_key, sec))
+                            if owner is not None and owner != worker_token:
+                                continue
+                        self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], scope_key, username, sec, reason)
+                        self._record_case_section_history(case, acc, sec, "ERROR", note=reason, active_accounts=ordered_accounts)
+                        progress_state.setdefault("done_steps", set()).add((idx, scope_key, sec))
+                        if log_details:
+                            detailed_log.append({
+                                "Invoice No": case.get("Invoice No", ""),
+                                "Account No": acc_no,
+                                "Search Name": search_name,
+                                "C-PRO Account": username,
+                                "Login Used": username,
+                                "DB Link Group": link_group or "Independent",
+                                "Section": sec,
+                                "Status": "CHECK ERROR",
+                                "Matched By": "-",
+                                "Billing Check": "-",
+                                "Upload Status": "-",
+                                "C-PRO Row Details": reason,
+                                "Round": round_label,
+                            })
+                done_count = len(progress_state.get("done_steps", ()))
+            self.set_progress(min(done_count, total_steps), total_steps)
+            self._save_check_state()
 
-                        self.refresh_table(active_idx=idx)
+        # Skip login cleanly when linked DB peer or previous saved session already checked every section/case
+        with state_lock:
+            has_work = any(
+                not self._is_case_done(self.cases_data[i], verify_mode)
+                and checked_pairs[i].get((scope_key, sec)) not in clean_states
+                and (in_flight_scope_claims is None or (i, scope_key, sec) not in in_flight_scope_claims)
+                for i in pass_indices
+                for sec in active_sections
+            )
+            if not has_work:
+                for i in pass_indices:
+                    for sec in active_sections:
+                        if in_flight_scope_claims is None or (i, scope_key, sec) not in in_flight_scope_claims:
+                            progress_state.setdefault("done_steps", set()).add((i, scope_key, sec))
+                done_count = len(progress_state.get("done_steps", ()))
+        if not has_work:
+            self.set_progress(min(done_count, total_steps), total_steps)
+            if link_group:
+                self.log(f"{browser_tag}[LINK SKIP] [{round_label}] '{username}' shares DB group '{link_group}' — already covered; skipping login.")
+            else:
+                self.log(f"{browser_tag}[RESUME SKIP] [{round_label}] '{username}' has no remaining unchecked cases; skipping login.")
+            return False
+
+        self.log(f"=== {browser_tag}[{round_label}] Starting Account: {username}" + (f" ({link_group})" if link_group else "") + " ===")
+
+        reused_session = False
+        context = None
+        page = None
+        if session_pool is not None and username in session_pool:
+            sess = session_pool[username]
+            try:
+                if sess.get("page") is not None and not sess["page"].is_closed():
+                    context = sess["context"]
+                    page = sess["page"]
+                    reused_session = True
+            except Exception:
+                context = None
+                page = None
+
+        if not reused_session:
+            context = browser.new_context()
+            page = context.new_page()
+            self._install_session_timeout_handler(page)
+            if session_pool is not None:
+                session_pool[username] = {"context": context, "page": page}
+
+        current_sec_idx = 0
+        current_section = active_sections[0] if active_sections else "(not selected)"
+        yielded_early = False
+
+        try:
+            if reused_session:
+                if (
+                    self._is_kicked_or_unauthorized(page)
+                    or self._is_on_case_details(page)
+                    or "/case-listing" not in page.url.lower()
+                ):
+                    self.log(f"{browser_tag}[SESSION] Pooled session for {username} needs restore; re-authenticating...")
+                    self._login_and_restore_section(page, acc, section=None)
+                else:
+                    self.log(f"{browser_tag}[SESSION] Reusing active authenticated session for {username}.")
+            else:
+                self._login_and_restore_section(page, acc, section=None)
+
+            for sec_idx, section in enumerate(active_sections):
+                if self.stop_requested:
+                    break
+                if should_yield_cb is not None and should_yield_cb():
+                    self.log(
+                        f"[PARALLEL] Browser #{slot_id + 1} yielding '{username}' cleanly "
+                        f"(scaled down to {self.get_target_browser_count()} browser(s))."
+                    )
+                    yielded_early = True
+                    break
+
+                # Skip entire section if all cases are done, already evaluated, or currently claimed for (scope_key, section)
+                with state_lock:
+                    sec_needed = any(
+                        not self._is_case_done(self.cases_data[i], verify_mode)
+                        and checked_pairs[i].get((scope_key, section)) not in clean_states
+                        and (in_flight_scope_claims is None or (i, scope_key, section) not in in_flight_scope_claims)
+                        for i in pass_indices
+                    )
+                if not sec_needed:
+                    continue
+
+                current_sec_idx = sec_idx
+                current_section = section
+                self.log(f"{browser_tag}[{username}] Switching to section: {section}")
+
+                section_loaded = False
+                last_section_err = None
+                for sec_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
+                    if self.stop_requested:
+                        break
+                    try:
+                        needs_restore = (
+                            sec_attempt > 1
+                            or self._is_kicked_or_unauthorized(page)
+                            or self._is_on_case_details(page)
+                            or "/case-listing" not in page.url.lower()
+                        )
+                        if needs_restore:
+                            self._login_and_restore_section(page, acc, section=section)
+                        else:
+                            self._switch_section_and_wait(page, section)
+                        section_loaded = True
+                        break
+                    except InvalidCredentialsError as sec_auth_err:
+                        if self._is_fatal_auth_error(sec_auth_err):
+                            raise
+                        last_section_err = sec_auth_err
+                        self.log(
+                            f"{browser_tag}[!] Session expired/kicked switching to '{section}' "
+                            f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}): {sec_auth_err}. Re-logging..."
+                        )
+                        page.wait_for_timeout(800)
+                    except Exception as section_error:
+                        if self.stop_requested:
+                            break
+                        last_section_err = section_error
+                        self.log(
+                            f"{browser_tag}[!] Section '{section}' failed to load "
+                            f"(Attempt {sec_attempt}/{MAX_RETRIES_ON_KICKOUT}: {section_error}). Re-authenticating & retrying..."
+                        )
+                        page.wait_for_timeout(800)
+
+                if self.stop_requested:
+                    break
+                if not section_loaded:
+                    err_msg = f"Could not load the {section} section table after {MAX_RETRIES_ON_KICKOUT} attempt(s): {last_section_err}"
+                    self.log(f"{browser_tag}[ERROR] [{username}] {err_msg}")
+                    _mark_sections_error([section], err_msg)
+                    self.refresh_table()
+                    continue
+
+                for idx in pass_indices:
+                    if self.stop_requested:
+                        break
+                    if should_yield_cb is not None and should_yield_cb():
+                        self.log(
+                            f"[PARALLEL] Browser #{slot_id + 1} yielding '{username}' cleanly "
+                            f"(scaled down to {self.get_target_browser_count()} browser(s))."
+                        )
+                        yielded_early = True
+                        break
+
+                    with state_lock:
+                        case = self.cases_data[idx]
+                        already_done = self._is_case_done(case, verify_mode)
+                        already_checked_pair = checked_pairs[idx].get((scope_key, section)) in clean_states
+                        claim_owner = in_flight_scope_claims.get((idx, scope_key, section)) if in_flight_scope_claims is not None else None
+                        already_claimed = claim_owner is not None and claim_owner != worker_token
+                        if not (already_done or already_checked_pair or already_claimed) and in_flight_scope_claims is not None:
+                            in_flight_scope_claims[(idx, scope_key, section)] = worker_token
+                    if already_claimed:
+                        continue
+                    if already_done or already_checked_pair:
+                        _mark_step_done(idx, section)
+                        continue
+
+                    row_mutated = False
+                    try:
+                        self.refresh_table(active_idx=idx if slot_id == 0 else None)
                         acc_no = case.get("Account No", "").strip()
                         alt_acc_no = case.get("Alt Account No", "").strip()
                         search_name = (case.get("Search Name") or case.get("Full Borrower Name") or "").strip()
@@ -5028,7 +5999,7 @@ class CProSuiteApp:
                             if search_name:
                                 search_attempts.append(("Primary Borrower Name", search_name, f"Name ({search_name})"))
                             elif mode == "ACCOUNT_THEN_NAME":
-                                self.log(f"  [!] Cannot fallback to Name for {acc_no} (Name is empty).")
+                                self.log(f"{browser_tag}  [!] Cannot fallback to Name for {acc_no} (Name is empty).")
 
                         checked_row_summaries = set()
                         found_any_row = False
@@ -5039,6 +6010,10 @@ class CProSuiteApp:
                         for s_col, s_val, s_label in search_attempts:
                             if self.stop_requested or case_resolved_in_pair:
                                 break
+                            with state_lock:
+                                if self._is_case_done(case, verify_mode):
+                                    case_resolved_in_pair = True
+                                    break
                             try:
                                 matched_rows = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
                             except InvalidCredentialsError as auth_err:
@@ -5046,22 +6021,26 @@ class CProSuiteApp:
                                     raise
                                 if self.stop_requested:
                                     break
-                                self.log(f"  [ERROR] Session error searching '{s_val}' after retries: {auth_err}. Marking this row only & recovering section...")
-                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(auth_err))
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": "CHECK ERROR",
-                                    "Matched By": s_label,
-                                    "Billing Check": "-",
-                                    "Upload Status": "-",
-                                    "C-PRO Row Details": str(auth_err),
-                                    "Round": round_label,
-                                })
+                                self.log(f"{browser_tag}  [ERROR] Session error searching '{s_val}' after retries: {auth_err}. Marking this row only & recovering section...")
+                                with state_lock:
+                                    self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], scope_key, username, section, str(auth_err))
+                                    self._record_case_section_history(case, acc, section, "ERROR", note=str(auth_err), active_accounts=ordered_accounts)
+                                    detailed_log.append({
+                                        "Invoice No": case.get("Invoice No", ""),
+                                        "Account No": acc_no,
+                                        "Search Name": search_name,
+                                        "C-PRO Account": username,
+                                        "Login Used": username,
+                                        "DB Link Group": link_group or "Independent",
+                                        "Section": section,
+                                        "Status": "CHECK ERROR",
+                                        "Matched By": s_label,
+                                        "Billing Check": "-",
+                                        "Upload Status": "-",
+                                        "C-PRO Row Details": str(auth_err),
+                                        "Round": round_label,
+                                    })
+                                row_mutated = True
                                 try:
                                     self._login_and_restore_section(page, acc, section=section)
                                 except InvalidCredentialsError as rec_err:
@@ -5074,22 +6053,26 @@ class CProSuiteApp:
                             except Exception as e:
                                 if self.stop_requested:
                                     break
-                                self.log(f"  [ERROR] Search failed for '{s_val}': {e}")
-                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(e))
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": "CHECK ERROR",
-                                    "Matched By": s_label,
-                                    "Billing Check": "-",
-                                    "Upload Status": "-",
-                                    "C-PRO Row Details": str(e),
-                                    "Round": round_label,
-                                })
+                                self.log(f"{browser_tag}  [ERROR] Search failed for '{s_val}': {e}")
+                                with state_lock:
+                                    self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], scope_key, username, section, str(e))
+                                    self._record_case_section_history(case, acc, section, "ERROR", note=str(e), active_accounts=ordered_accounts)
+                                    detailed_log.append({
+                                        "Invoice No": case.get("Invoice No", ""),
+                                        "Account No": acc_no,
+                                        "Search Name": search_name,
+                                        "C-PRO Account": username,
+                                        "Login Used": username,
+                                        "DB Link Group": link_group or "Independent",
+                                        "Section": section,
+                                        "Status": "CHECK ERROR",
+                                        "Matched By": s_label,
+                                        "Billing Check": "-",
+                                        "Upload Status": "-",
+                                        "C-PRO Row Details": str(e),
+                                        "Round": round_label,
+                                    })
+                                row_mutated = True
                                 pair_had_error = True
                                 break
 
@@ -5101,246 +6084,310 @@ class CProSuiteApp:
                                 continue
 
                             found_any_row = True
-                            self.log(f"  ✓ FOUND by {s_label}: {search_name or acc_no} in {username} -> {section} ({len(new_rows)} new row(s))")
+                            self.log(f"{browser_tag}  ✓ FOUND by {s_label}: {search_name or acc_no} in {username} -> {section} ({len(new_rows)} new row(s))")
 
                             if not verify_mode:
-                                checked_pairs[idx][(acc_idx, section)] = "MATCHED"
-                                found_tracker[idx]["accounts"].append(username)
-                                found_tracker[idx]["sections"].append(f"{username}: {section}")
-                                found_tracker[idx]["details"].extend(m[1] for m in new_rows)
-                                if hasattr(self, "account_hit_counts"):
-                                    self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
-                                if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
-                                    self.account_prefix_affinity[acc_no[:4]] = username
+                                with state_lock:
+                                    if self._is_case_done(case, verify_mode):
+                                        case_resolved_in_pair = True
+                                        break
+                                    checked_pairs[idx][(scope_key, section)] = "MATCHED_AVAIL"
+                                    self._record_case_section_history(case, acc, section, "MATCHED_AVAIL", active_accounts=ordered_accounts)
+                                    found_tracker[idx]["accounts"].append(username)
+                                    found_tracker[idx]["sections"].append(f"{username}: {section}")
+                                    found_tracker[idx]["details"].extend(m[1] for m in new_rows)
+                                    case["_found_accounts"] = list(dict.fromkeys(found_tracker[idx]["accounts"]))
+                                    case["_found_sections"] = list(dict.fromkeys(found_tracker[idx]["sections"]))
+                                    case["_found_details"] = list(dict.fromkeys(found_tracker[idx]["details"]))
+                                    if hasattr(self, "account_hit_counts"):
+                                        self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
+                                    if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
+                                        self.account_prefix_affinity[acc_no[:4]] = username
 
-                                case["Availability Status"] = "AVAILABLE"
-                                case["Found In Account(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["accounts"]))
-                                case["Found In Section(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["sections"]))
-                                case["C-PRO Row Details"] = " || ".join(found_tracker[idx]["details"])
-                                for m in new_rows:
-                                    checked_row_summaries.add(m[1])
+                                    case["Availability Status"] = "AVAILABLE"
+                                    case["Found In Account(s)"] = ", ".join(case["_found_accounts"])
+                                    case["Found In Section(s)"] = ", ".join(case["_found_sections"])
+                                    case["C-PRO Row Details"] = " || ".join(case["_found_details"])
+                                    for m in new_rows:
+                                        checked_row_summaries.add(m[1])
+                                        detailed_log.append({
+                                            "Invoice No": case.get("Invoice No", ""),
+                                            "Account No": acc_no,
+                                            "Search Name": search_name,
+                                            "C-PRO Account": username,
+                                            "Login Used": username,
+                                            "DB Link Group": link_group or "Independent",
+                                            "Section": section,
+                                            "Status": "AVAILABLE",
+                                            "Matched By": s_label,
+                                            "Billing Check": "Skipped (Availability Only)",
+                                            "Upload Status": "Skipped",
+                                            "C-PRO Row Details": m[1],
+                                            "Round": round_label,
+                                        })
+                                row_mutated = True
+                                case_resolved_in_pair = True
+                                break
+
+                            case_lock = case_locks.get(idx) if case_locks is not None else None
+                            if case_lock is not None:
+                                case_lock.acquire()
+                            try:
+                                with state_lock:
+                                    if self._is_case_done(case, verify_mode):
+                                        case_resolved_in_pair = True
+                                        break
+
+                                wf = None
+                                wf_last_err = None
+                                current_matches = matched_rows
+                                for wf_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
+                                    if self.stop_requested:
+                                        break
+                                    try:
+                                        wf = self._process_matched_rows_for_case(
+                                            page, acc, section, s_col, s_val, current_matches, case, skip_summaries=checked_row_summaries
+                                        )
+                                        wf_last_err = None
+                                        break
+                                    except InvalidCredentialsError as wf_auth_err:
+                                        if self._is_fatal_auth_error(wf_auth_err):
+                                            raise
+                                        wf_last_err = wf_auth_err
+                                        if wf_attempt < MAX_RETRIES_ON_KICKOUT and not self.stop_requested:
+                                            self.log(
+                                                f"{browser_tag}  [!] Session expired inside Case Details for '{acc_no}' "
+                                                f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_auth_err}). Re-logging & retrying..."
+                                            )
+                                            try:
+                                                self._login_and_restore_section(page, acc, section=section)
+                                                current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
+                                                if not current_matches:
+                                                    wf = {
+                                                        "outcome": "ALL_SKIPPED",
+                                                        "billing_detail": "",
+                                                        "upload_status": "",
+                                                        "extracted_pdf": "-",
+                                                        "matched_row_detail": "-",
+                                                    }
+                                                    wf_last_err = None
+                                                    break
+                                            except InvalidCredentialsError as rec_err:
+                                                if self._is_fatal_auth_error(rec_err):
+                                                    raise
+                                                wf_last_err = rec_err
+                                            except Exception as rec_err:
+                                                wf_last_err = rec_err
+                                            continue
+                                        break
+                                    except Exception as wf_err:
+                                        if self.stop_requested:
+                                            break
+                                        err_low = str(wf_err).lower()
+                                        is_recoverable_nav = (
+                                            "execution context was destroyed" in err_low
+                                            or self._is_kicked_or_unauthorized(page)
+                                        )
+                                        wf_last_err = wf_err
+                                        if is_recoverable_nav and wf_attempt < MAX_RETRIES_ON_KICKOUT:
+                                            self.log(
+                                                f"{browser_tag}  [!] Navigation/session hiccup inside Case Details for '{acc_no}' "
+                                                f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_err}). Re-logging & retrying..."
+                                            )
+                                            try:
+                                                self._login_and_restore_section(page, acc, section=section)
+                                                current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
+                                                if not current_matches:
+                                                    wf = {
+                                                        "outcome": "ALL_SKIPPED",
+                                                        "billing_detail": "",
+                                                        "upload_status": "",
+                                                        "extracted_pdf": "-",
+                                                        "matched_row_detail": "-",
+                                                    }
+                                                    wf_last_err = None
+                                                    break
+                                            except InvalidCredentialsError as rec_err:
+                                                if self._is_fatal_auth_error(rec_err):
+                                                    raise
+                                                wf_last_err = rec_err
+                                            except Exception as rec_err:
+                                                wf_last_err = rec_err
+                                            continue
+                                        break
+
+                                if wf is None:
+                                    if self.stop_requested:
+                                        break
+                                    self.log(f"{browser_tag}  [ERROR] Workflow failed inside Case Details for '{acc_no}': {wf_last_err}")
+                                    with state_lock:
+                                        self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], scope_key, username, section, str(wf_last_err))
+                                        self._record_case_section_history(case, acc, section, "ERROR", note=str(wf_last_err), active_accounts=ordered_accounts)
+                                        detailed_log.append({
+                                            "Invoice No": case.get("Invoice No", ""),
+                                            "Account No": acc_no,
+                                            "Search Name": search_name,
+                                            "C-PRO Account": username,
+                                            "Login Used": username,
+                                            "DB Link Group": link_group or "Independent",
+                                            "Section": section,
+                                            "Status": "CHECK ERROR",
+                                            "Matched By": s_label,
+                                            "Billing Check": "Error",
+                                            "Upload Status": "Error",
+                                            "C-PRO Row Details": str(wf_last_err),
+                                            "Round": round_label,
+                                        })
+                                    row_mutated = True
+                                    try:
+                                        self._return_to_case_listing_and_restore_section(page, acc, section)
+                                    except InvalidCredentialsError as rec_err:
+                                        if self._is_fatal_auth_error(rec_err):
+                                            raise
+                                        try:
+                                            self._login_and_restore_section(page, acc, section=section)
+                                        except InvalidCredentialsError as rec_err2:
+                                            if self._is_fatal_auth_error(rec_err2):
+                                                raise
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                    pair_had_error = True
+                                    break
+
+                                outcome = wf["outcome"]
+                                if outcome == "ALL_SKIPPED":
+                                    continue
+                                if outcome in ("COMPLETE", "BILLING_NO_PDF"):
+                                    with state_lock:
+                                        checked_pairs[idx][(scope_key, section)] = "MATCHED"
+                                        self._record_case_section_history(case, acc, section, "MATCHED", active_accounts=ordered_accounts)
+                                        found_tracker[idx]["accounts"].append(username)
+                                        found_tracker[idx]["sections"].append(f"{username}: {section}")
+                                        found_tracker[idx]["details"].append(wf["matched_row_detail"])
+                                        case["_found_accounts"] = list(dict.fromkeys(found_tracker[idx]["accounts"]))
+                                        case["_found_sections"] = list(dict.fromkeys(found_tracker[idx]["sections"]))
+                                        case["_found_details"] = list(dict.fromkeys(found_tracker[idx]["details"]))
+                                        if hasattr(self, "account_hit_counts"):
+                                            self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
+                                        if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
+                                            self.account_prefix_affinity[acc_no[:4]] = username
+
+                                        case["Availability Status"] = "COMPLETE" if outcome == "COMPLETE" else "BILLING MATCHED (No PDF)"
+                                        case["Found In Account(s)"] = ", ".join(case["_found_accounts"])
+                                        case["Found In Section(s)"] = ", ".join(case["_found_sections"])
+                                        case["Billing Check"] = wf["billing_detail"]
+                                        case["Upload Status"] = wf["upload_status"]
+                                        case["Extracted Invoice PDF"] = wf["extracted_pdf"]
+                                        case["C-PRO Row Details"] = " || ".join(case["_found_details"])
+
+                                        detailed_log.append({
+                                            "Invoice No": case.get("Invoice No", ""),
+                                            "Account No": acc_no,
+                                            "Search Name": search_name,
+                                            "C-PRO Account": username,
+                                            "Login Used": username,
+                                            "DB Link Group": link_group or "Independent",
+                                            "Section": section,
+                                            "Status": case["Availability Status"],
+                                            "Matched By": s_label,
+                                            "Billing Check": wf["billing_detail"],
+                                            "Upload Status": wf["upload_status"],
+                                            "C-PRO Row Details": wf["matched_row_detail"],
+                                            "Round": round_label,
+                                        })
+                                    row_mutated = True
+                                    case_resolved_in_pair = True
+                                    break
+                                else:
+                                    last_mismatch_detail = wf["billing_detail"]
+                                    with state_lock:
+                                        detailed_log.append({
+                                            "Invoice No": case.get("Invoice No", ""),
+                                            "Account No": acc_no,
+                                            "Search Name": search_name,
+                                            "C-PRO Account": username,
+                                            "Login Used": username,
+                                            "DB Link Group": link_group or "Independent",
+                                            "Section": section,
+                                            "Status": "NONE (Billing Mismatch)",
+                                            "Matched By": s_label,
+                                            "Billing Check": wf["billing_detail"],
+                                            "Upload Status": wf["upload_status"],
+                                            "C-PRO Row Details": wf["matched_row_detail"],
+                                            "Round": round_label,
+                                        })
+                            finally:
+                                if case_lock is not None:
+                                    case_lock.release()
+
+                        if not pair_had_error and not case_resolved_in_pair and (wf_done_when_stopped := (not self.stop_requested or found_any_row)):
+                            if self.stop_requested and not found_any_row:
+                                pass
+                            elif found_any_row:
+                                if not self.stop_requested:
+                                    with state_lock:
+                                        self._record_case_section_history(
+                                            case, acc, section, "BILLING_MISMATCH",
+                                            note=last_mismatch_detail, active_accounts=ordered_accounts,
+                                        )
+                                        self._resolve_case_after_clean_pair(
+                                            case, checked_pairs[idx], error_reasons[idx],
+                                            scope_key, username, section, active_scopes, active_sections,
+                                            pair_state="BILLING_MISMATCH",
+                                            mismatch_note=last_mismatch_detail,
+                                        )
+                                    row_mutated = True
+                            else:
+                                self.log(f"{browser_tag}  ✗ NOT FOUND: {search_name or acc_no or '(no search value)'} in {username} -> {section}")
+                                with state_lock:
+                                    self._record_case_section_history(
+                                        case, acc, section, "NOT_FOUND",
+                                        active_accounts=ordered_accounts,
+                                    )
+                                    self._resolve_case_after_clean_pair(
+                                        case, checked_pairs[idx], error_reasons[idx],
+                                        scope_key, username, section, active_scopes, active_sections,
+                                        pair_state="NOT_FOUND",
+                                    )
                                     detailed_log.append({
                                         "Invoice No": case.get("Invoice No", ""),
                                         "Account No": acc_no,
                                         "Search Name": search_name,
                                         "C-PRO Account": username,
                                         "Login Used": username,
+                                        "DB Link Group": link_group or "Independent",
                                         "Section": section,
-                                        "Status": "AVAILABLE",
-                                        "Matched By": s_label,
-                                        "Billing Check": "Skipped (Availability Only)",
-                                        "Upload Status": "Skipped",
-                                        "C-PRO Row Details": m[1],
+                                        "Status": "Not Found",
+                                        "Matched By": "-",
+                                        "Billing Check": "-",
+                                        "Upload Status": "-",
+                                        "C-PRO Row Details": "-",
                                         "Round": round_label,
                                     })
-                                case_resolved_in_pair = True
-                                break
+                                row_mutated = True
 
-                            wf = None
-                            wf_last_err = None
-                            current_matches = matched_rows
-                            for wf_attempt in range(1, MAX_RETRIES_ON_KICKOUT + 1):
-                                if self.stop_requested:
-                                    break
-                                try:
-                                    wf = self._process_matched_rows_for_case(
-                                        page, acc, section, s_col, s_val, current_matches, case, skip_summaries=checked_row_summaries
-                                    )
-                                    wf_last_err = None
-                                    break
-                                except InvalidCredentialsError as wf_auth_err:
-                                    if self._is_fatal_auth_error(wf_auth_err):
-                                        raise
-                                    wf_last_err = wf_auth_err
-                                    if wf_attempt < MAX_RETRIES_ON_KICKOUT and not self.stop_requested:
-                                        self.log(
-                                            f"  [!] Session expired inside Case Details for '{acc_no}' "
-                                            f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_auth_err}). Re-logging & retrying..."
-                                        )
-                                        try:
-                                            self._login_and_restore_section(page, acc, section=section)
-                                            current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
-                                            if not current_matches:
-                                                wf = {
-                                                    "outcome": "ALL_SKIPPED",
-                                                    "billing_detail": "",
-                                                    "upload_status": "",
-                                                    "extracted_pdf": "-",
-                                                    "matched_row_detail": "-",
-                                                }
-                                                wf_last_err = None
-                                                break
-                                        except InvalidCredentialsError as rec_err:
-                                            if self._is_fatal_auth_error(rec_err):
-                                                raise
-                                            wf_last_err = rec_err
-                                        except Exception as rec_err:
-                                            wf_last_err = rec_err
-                                        continue
-                                    break
-                                except Exception as wf_err:
-                                    if self.stop_requested:
-                                        break
-                                    err_low = str(wf_err).lower()
-                                    is_recoverable_nav = (
-                                        "execution context was destroyed" in err_low
-                                        or self._is_kicked_or_unauthorized(page)
-                                    )
-                                    wf_last_err = wf_err
-                                    if is_recoverable_nav and wf_attempt < MAX_RETRIES_ON_KICKOUT:
-                                        self.log(
-                                            f"  [!] Navigation/session hiccup inside Case Details for '{acc_no}' "
-                                            f"(Attempt {wf_attempt}/{MAX_RETRIES_ON_KICKOUT}: {wf_err}). Re-logging & retrying..."
-                                        )
-                                        try:
-                                            self._login_and_restore_section(page, acc, section=section)
-                                            current_matches = self._search_grid_with_relogin(page, acc, section, s_col, s_val)
-                                            if not current_matches:
-                                                wf = {
-                                                    "outcome": "ALL_SKIPPED",
-                                                    "billing_detail": "",
-                                                    "upload_status": "",
-                                                    "extracted_pdf": "-",
-                                                    "matched_row_detail": "-",
-                                                }
-                                                wf_last_err = None
-                                                break
-                                        except InvalidCredentialsError as rec_err:
-                                            if self._is_fatal_auth_error(rec_err):
-                                                raise
-                                            wf_last_err = rec_err
-                                        except Exception as rec_err:
-                                            wf_last_err = rec_err
-                                        continue
-                                    break
-
-                            if self.stop_requested:
-                                break
-                            if wf is None:
-                                self.log(f"  [ERROR] Workflow failed inside Case Details for '{acc_no}': {wf_last_err}")
-                                self._mark_case_error(case, checked_pairs[idx], error_reasons[idx], acc_idx, username, section, str(wf_last_err))
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": "CHECK ERROR",
-                                    "Matched By": s_label,
-                                    "Billing Check": "Error",
-                                    "Upload Status": "Error",
-                                    "C-PRO Row Details": str(wf_last_err),
-                                    "Round": round_label,
-                                })
-                                try:
-                                    self._return_to_case_listing_and_restore_section(page, acc, section)
-                                except InvalidCredentialsError as rec_err:
-                                    if self._is_fatal_auth_error(rec_err):
-                                        raise
-                                    try:
-                                        self._login_and_restore_section(page, acc, section=section)
-                                    except InvalidCredentialsError as rec_err2:
-                                        if self._is_fatal_auth_error(rec_err2):
-                                            raise
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
-                                pair_had_error = True
-                                break
-
-                            outcome = wf["outcome"]
-                            if outcome == "ALL_SKIPPED":
-                                continue
-                            if outcome in ("COMPLETE", "BILLING_NO_PDF"):
-                                checked_pairs[idx][(acc_idx, section)] = "MATCHED"
-                                found_tracker[idx]["accounts"].append(username)
-                                found_tracker[idx]["sections"].append(f"{username}: {section}")
-                                found_tracker[idx]["details"].append(wf["matched_row_detail"])
-                                if hasattr(self, "account_hit_counts"):
-                                    self.account_hit_counts[username] = self.account_hit_counts.get(username, 0) + 1
-                                if len(acc_no) >= 4 and hasattr(self, "account_prefix_affinity"):
-                                    self.account_prefix_affinity[acc_no[:4]] = username
-
-                                case["Availability Status"] = "COMPLETE" if outcome == "COMPLETE" else "BILLING MATCHED (No PDF)"
-                                case["Found In Account(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["accounts"]))
-                                case["Found In Section(s)"] = ", ".join(dict.fromkeys(found_tracker[idx]["sections"]))
-                                case["Billing Check"] = wf["billing_detail"]
-                                case["Upload Status"] = wf["upload_status"]
-                                case["Extracted Invoice PDF"] = wf["extracted_pdf"]
-                                case["C-PRO Row Details"] = " || ".join(found_tracker[idx]["details"])
-
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": case["Availability Status"],
-                                    "Matched By": s_label,
-                                    "Billing Check": wf["billing_detail"],
-                                    "Upload Status": wf["upload_status"],
-                                    "C-PRO Row Details": wf["matched_row_detail"],
-                                    "Round": round_label,
-                                })
-                                case_resolved_in_pair = True
-                                break
-                            else:
-                                # Billing date/amount did not match -> record detail and continue checking remaining accounts/name fallback
-                                last_mismatch_detail = wf["billing_detail"]
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": "NONE (Billing Mismatch)",
-                                    "Matched By": s_label,
-                                    "Billing Check": wf["billing_detail"],
-                                    "Upload Status": wf["upload_status"],
-                                    "C-PRO Row Details": wf["matched_row_detail"],
-                                    "Round": round_label,
-                                })
-
-                        if not self.stop_requested and not pair_had_error and not case_resolved_in_pair:
-                            if found_any_row:
-                                self._resolve_case_after_clean_pair(
-                                    case, checked_pairs[idx], error_reasons[idx],
-                                    acc_idx, username, section, ordered_accounts, active_sections,
-                                    pair_state="BILLING_MISMATCH",
-                                    mismatch_note=last_mismatch_detail,
-                                )
-                            else:
-                                self.log(f"  ✗ NOT FOUND: {search_name or acc_no or '(no search value)'} in {username} -> {section}")
-                                self._resolve_case_after_clean_pair(
-                                    case, checked_pairs[idx], error_reasons[idx],
-                                    acc_idx, username, section, ordered_accounts, active_sections,
-                                    pair_state="NOT_FOUND",
-                                )
-                                detailed_log.append({
-                                    "Invoice No": case.get("Invoice No", ""),
-                                    "Account No": acc_no,
-                                    "Search Name": search_name,
-                                    "C-PRO Account": username,
-                                    "Login Used": username,
-                                    "Section": section,
-                                    "Status": "Not Found",
-                                    "Matched By": "-",
-                                    "Billing Check": "-",
-                                    "Upload Status": "-",
-                                    "C-PRO Row Details": "-",
-                                    "Round": round_label,
-                                })
-
-                        completed_steps += 1
-                        self.set_progress(completed_steps, total_steps)
+                        if not self.stop_requested:
+                            _mark_step_done(idx, section)
                         self.refresh_table()
+                    finally:
+                        if in_flight_scope_claims is not None:
+                            with state_lock:
+                                if in_flight_scope_claims.get((idx, scope_key, section)) == worker_token:
+                                    in_flight_scope_claims.pop((idx, scope_key, section), None)
+                        if row_mutated:
+                            self._save_check_state()
 
-            except InvalidCredentialsError as e:
-                if "rejected" in str(e).lower() or "cancelled" in str(e).lower():
+                if yielded_early:
+                    break
+
+            if _all_done() and not yielded_early:
+                self.set_progress(total_steps, total_steps)
+
+        except InvalidCredentialsError as e:
+            if "rejected" in str(e).lower() or "cancelled" in str(e).lower():
+                with state_lock:
                     for idx in pass_indices:
                         pending_case = self.cases_data[idx]
                         if not self._is_case_done(pending_case, verify_mode):
@@ -5348,34 +6395,316 @@ class CProSuiteApp:
                             pending_case["Found In Account(s)"] = "Login not verified"
                             pending_case["Found In Section(s)"] = f"{username}: authentication"
                             pending_case["C-PRO Row Details"] = str(e)
-                    self.refresh_table()
-                    self.log(f"[AUTH STOP] {e} Automation paused to protect account.")
-                    self._safe_ui_after(0, lambda msg=str(e): messagebox.showwarning("C-PRO Login Stopped", msg + "\n\nCorrect the password in the left panel, then restart.", parent=self.root))
-                    self.stop_requested = True
-                else:
-                    _mark_sections_error(acc_idx, username, active_sections[current_sec_idx:], str(e))
-                    completed_steps = (acc_idx + 1) * len(active_sections) * len(pass_indices)
-                    self.set_progress(min(completed_steps, total_steps), total_steps)
-                    self.refresh_table()
-                    self.log(f"[AUTH ERROR] {username} could not re-authenticate: {e}. Continuing to next account.")
-            except (GridLoadTimeoutError, GridSearchError) as e:
-                _mark_sections_error(acc_idx, username, active_sections[current_sec_idx:], str(e))
-                completed_steps = (acc_idx + 1) * len(active_sections) * len(pass_indices)
-                self.set_progress(min(completed_steps, total_steps), total_steps)
-                self.log(f"[ERROR] {username} could not complete a search in {current_section}: {e}.")
                 self.refresh_table()
-            except Exception as e:
-                _mark_sections_error(acc_idx, username, active_sections[current_sec_idx:], str(e))
-                completed_steps = (acc_idx + 1) * len(active_sections) * len(pass_indices)
-                self.set_progress(min(completed_steps, total_steps), total_steps)
-                self.log(f"[ERROR] Account {username} encountered an error: {e}")
+                self.log(f"{browser_tag}[AUTH STOP] {e} Automation paused to protect account.")
+                self._safe_ui_after(0, lambda msg=str(e): messagebox.showwarning("C-PRO Login Stopped", msg + "\n\nCorrect the password in the left panel, then restart.", parent=self.root))
+                self.stop_requested = True
+                cond = self._get_pool_cond()
+                with cond:
+                    cond.notify_all()
+            else:
+                _mark_sections_error(active_sections[current_sec_idx:], str(e))
                 self.refresh_table()
-            finally:
-                if session_pool is None:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
+                self.log(f"{browser_tag}[AUTH ERROR] {username} could not re-authenticate: {e}. Continuing to next account.")
+        except (GridLoadTimeoutError, GridSearchError) as e:
+            _mark_sections_error(active_sections[current_sec_idx:], str(e))
+            self.log(f"{browser_tag}[ERROR] {username} could not complete a search in {current_section}: {e}.")
+            self.refresh_table()
+        except Exception as e:
+            _mark_sections_error(active_sections[current_sec_idx:], str(e))
+            self.log(f"{browser_tag}[ERROR] Account {username} encountered an error: {e}")
+            self.refresh_table()
+        finally:
+            if session_pool is None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+        return yielded_early
+
+    def _run_check_pass(self, browser, active_accounts, active_sections, pass_indices, found_tracker, detailed_log, mode, verify_mode, round_label, session_pool=None):
+        ordered_accounts = self._order_accounts_by_affinity(active_accounts, pass_indices)
+        active_scopes, checked_pairs, error_reasons, pre_done_steps = self._hydrate_pass_tracking(
+            ordered_accounts, active_sections, pass_indices, found_tracker, verify_mode
+        )
+        # Re-evaluate any previously paused Pending/Error rows that now already satisfy active_scopes x active_sections
+        for idx in pass_indices:
+            case = self.cases_data[idx]
+            if not self._is_case_done(case, verify_mode) and not self._case_has_unresolved_history_error(case):
+                if all(checked_pairs[idx].get((sc, sec)) in ("NOT_FOUND", "BILLING_MISMATCH") for sc in active_scopes for sec in active_sections):
+                    self._resolve_case_after_clean_pair(
+                        case, checked_pairs[idx], error_reasons[idx],
+                        active_scopes[-1] if active_scopes else "", "", active_sections[-1] if active_sections else "",
+                        active_scopes, active_sections,
+                        pair_state=checked_pairs[idx].get((active_scopes[-1], active_sections[-1]), "NOT_FOUND") if active_scopes and active_sections else "NOT_FOUND",
+                    )
+        self.refresh_table()
+
+        total_steps = max(1, len(active_scopes) * len(active_sections) * len(pass_indices))
+        self.set_progress(min(len(pre_done_steps), total_steps), total_steps)
+        state_lock = threading.Lock()
+        progress_state = {"done_steps": set(pre_done_steps)}
+
+        for acc_idx, acc in enumerate(ordered_accounts):
+            if self.stop_requested:
+                break
+            if all(self._is_case_done(self.cases_data[i], verify_mode) for i in pass_indices):
+                self.set_progress(total_steps, total_steps)
+                break
+            self._run_account_in_pass(
+                browser=browser,
+                acc_idx=acc_idx,
+                acc=acc,
+                ordered_accounts=ordered_accounts,
+                active_sections=active_sections,
+                pass_indices=pass_indices,
+                checked_pairs=checked_pairs,
+                error_reasons=error_reasons,
+                found_tracker=found_tracker,
+                detailed_log=detailed_log,
+                mode=mode,
+                verify_mode=verify_mode,
+                round_label=round_label,
+                session_pool=session_pool,
+                state_lock=state_lock,
+                case_locks=None,
+                progress_state=progress_state,
+                slot_id=0,
+                should_yield_cb=None,
+                active_scopes=active_scopes,
+                in_flight_scope_claims=None,
+            )
+
+    def _run_dynamic_multi_browser_pass(
+        self,
+        pool_state,
+        active_accounts,
+        active_sections,
+        pass_indices,
+        found_tracker,
+        detailed_log,
+        mode,
+        verify_mode,
+        round_label,
+        headless,
+    ):
+        """Run active_accounts across 1..N live Playwright browser slots, scaling up/down dynamically mid-run."""
+        ordered_accounts = self._order_accounts_by_affinity(active_accounts, pass_indices)
+        active_scopes, checked_pairs, error_reasons, pre_done_steps = self._hydrate_pass_tracking(
+            ordered_accounts, active_sections, pass_indices, found_tracker, verify_mode
+        )
+        for idx in pass_indices:
+            case = self.cases_data[idx]
+            if not self._is_case_done(case, verify_mode) and not self._case_has_unresolved_history_error(case):
+                if all(checked_pairs[idx].get((sc, sec)) in ("NOT_FOUND", "BILLING_MISMATCH") for sc in active_scopes for sec in active_sections):
+                    self._resolve_case_after_clean_pair(
+                        case, checked_pairs[idx], error_reasons[idx],
+                        active_scopes[-1] if active_scopes else "", "", active_sections[-1] if active_sections else "",
+                        active_scopes, active_sections,
+                        pair_state=checked_pairs[idx].get((active_scopes[-1], active_sections[-1]), "NOT_FOUND") if active_scopes and active_sections else "NOT_FOUND",
+                    )
+        self.refresh_table()
+
+        total_steps = max(1, len(active_scopes) * len(active_sections) * len(pass_indices))
+        self.set_progress(min(len(pre_done_steps), total_steps), total_steps)
+
+        bctx = {
+            "pending": deque(enumerate(ordered_accounts)),
+            "in_flight": 0,
+            "ordered_accounts": ordered_accounts,
+            "active_scopes": active_scopes,
+            "active_sections": active_sections,
+            "pass_indices": pass_indices,
+            "checked_pairs": checked_pairs,
+            "error_reasons": error_reasons,
+            "found_tracker": found_tracker,
+            "detailed_log": detailed_log,
+            "mode": mode,
+            "verify_mode": verify_mode,
+            "round_label": round_label,
+            "state_lock": threading.Lock(),
+            "case_locks": {idx: threading.Lock() for idx in pass_indices},
+            "in_flight_scope_claims": {},
+            "active_scope_counts": {},
+            "progress_state": {"done_steps": set(pre_done_steps)},
+        }
+
+        cond = self._get_pool_cond()
+
+        def _spawn_slot(slot_id):
+            def _slot_loop():
+                self.log(f"[PARALLEL] Launching Browser #{slot_id + 1} worker...")
+                slot_session_pool = {}
+                try:
+                    with sync_playwright() as p:
+                        browser = self._launch_browser_for_slot(
+                            p, headless=headless, slot_id=slot_id, multi_window=(self.get_target_browser_count() > 1 or slot_id > 0)
+                        )
+                        try:
+                            with cond:
+                                self._active_browser_count = len(pool_state["live_slots"])
+                            self._update_browser_count_ui()
+
+                            while not self.stop_requested:
+                                skipped_items = []
+                                with cond:
+                                    if pool_state["shutdown"] or slot_id >= self.get_target_browser_count():
+                                        break
+                                    cur_batch = pool_state.get("current_batch")
+                                    if cur_batch is None or not cur_batch["pending"]:
+                                        cond.wait(timeout=0.2)
+                                        continue
+                                    with cur_batch["state_lock"]:
+                                        all_done_now = all(
+                                            self._is_case_done(self.cases_data[i], cur_batch["verify_mode"])
+                                            for i in cur_batch["pass_indices"]
+                                        )
+                                        if not all_done_now:
+                                            c_states = self._clean_states_for_mode(cur_batch["verify_mode"])
+                                            claims = cur_batch["in_flight_scope_claims"]
+                                            c_pairs = cur_batch["checked_pairs"]
+                                            p_indices = cur_batch["pass_indices"]
+                                            a_secs = cur_batch["active_sections"]
+                                            eligible = deque()
+                                            for pend_idx, pend_acc in cur_batch["pending"]:
+                                                sc = self._get_account_db_scope(pend_acc)
+                                                has_work = any(
+                                                    not self._is_case_done(self.cases_data[i], cur_batch["verify_mode"])
+                                                    and c_pairs[i].get((sc, sec)) not in c_states
+                                                    and (i, sc, sec) not in claims
+                                                    for i in p_indices
+                                                    for sec in a_secs
+                                                )
+                                                if has_work:
+                                                    eligible.append((pend_idx, pend_acc))
+                                                else:
+                                                    skipped_items.append((pend_acc, sc))
+                                            cur_batch["pending"] = eligible
+                                    if all_done_now or not cur_batch["pending"]:
+                                        cur_batch["pending"].clear()
+                                        cond.notify_all()
+                                        acc_idx = None
+                                        acc = None
+                                    else:
+                                        scope_counts = cur_batch["active_scope_counts"]
+                                        pending_list = list(cur_batch["pending"])
+                                        best_pos = min(
+                                            range(len(pending_list)),
+                                            key=lambda pos: (
+                                                scope_counts.get(self._get_account_db_scope(pending_list[pos][1]), 0),
+                                                0 if pending_list[pos][1]["username"] in slot_session_pool else 1,
+                                            ),
+                                        )
+                                        acc_idx, acc = pending_list.pop(best_pos)
+                                        cur_batch["pending"] = deque(pending_list)
+                                        claimed_scope = self._get_account_db_scope(acc)
+                                        scope_counts[claimed_scope] = scope_counts.get(claimed_scope, 0) + 1
+                                        cur_batch["in_flight"] += 1
+
+                                for sk_acc, _sk_scope in skipped_items:
+                                    lg = self._normalize_link_group(sk_acc.get("link_group", ""))
+                                    if lg:
+                                        self.log(f"[LINK SKIP] '{sk_acc['username']}' shares DB group '{lg}' — already covered; skipping login.")
+                                    else:
+                                        self.log(f"[RESUME SKIP] '{sk_acc['username']}' has no remaining unchecked cases; skipping login.")
+
+                                if acc is None:
+                                    continue
+
+                                yielded = False
+                                claimed_scope = self._get_account_db_scope(acc)
+                                try:
+                                    yielded = self._run_account_in_pass(
+                                        browser=browser,
+                                        acc_idx=acc_idx,
+                                        acc=acc,
+                                        ordered_accounts=cur_batch["ordered_accounts"],
+                                        active_sections=cur_batch["active_sections"],
+                                        pass_indices=cur_batch["pass_indices"],
+                                        checked_pairs=cur_batch["checked_pairs"],
+                                        error_reasons=cur_batch["error_reasons"],
+                                        found_tracker=cur_batch["found_tracker"],
+                                        detailed_log=cur_batch["detailed_log"],
+                                        mode=cur_batch["mode"],
+                                        verify_mode=cur_batch["verify_mode"],
+                                        round_label=cur_batch["round_label"],
+                                        session_pool=slot_session_pool,
+                                        state_lock=cur_batch["state_lock"],
+                                        case_locks=cur_batch["case_locks"],
+                                        progress_state=cur_batch["progress_state"],
+                                        slot_id=slot_id,
+                                        should_yield_cb=lambda sid=slot_id: sid >= self.get_target_browser_count(),
+                                        active_scopes=cur_batch["active_scopes"],
+                                        in_flight_scope_claims=cur_batch["in_flight_scope_claims"],
+                                    )
+                                finally:
+                                    with cond:
+                                        if yielded:
+                                            cur_batch["pending"].appendleft((acc_idx, acc))
+                                        cur_batch["active_scope_counts"][claimed_scope] = max(
+                                            0, cur_batch["active_scope_counts"].get(claimed_scope, 1) - 1
+                                        )
+                                        cur_batch["in_flight"] -= 1
+                                        cond.notify_all()
+                                if yielded:
+                                    break
+                        finally:
+                            for sess in slot_session_pool.values():
+                                try:
+                                    if sess.get("context") is not None:
+                                        sess["context"].close()
+                                except Exception:
+                                    pass
+                            slot_session_pool.clear()
+                            try:
+                                browser.close()
+                            except Exception:
+                                pass
+                except Exception as slot_err:
+                    self.log(f"[PARALLEL ERROR] Browser #{slot_id + 1} encountered an error: {slot_err}")
+                finally:
+                    with cond:
+                        pool_state["live_slots"].pop(slot_id, None)
+                        self._active_browser_count = len(pool_state["live_slots"])
+                        cond.notify_all()
+                    self._update_browser_count_ui()
+                    self.log(f"[PARALLEL] Closed Browser #{slot_id + 1}.")
+
+            t = threading.Thread(target=_slot_loop, daemon=True)
+            pool_state["live_slots"][slot_id] = t
+            t.start()
+
+        with cond:
+            pool_state["current_batch"] = bctx
+            cond.notify_all()
+
+        try:
+            while True:
+                with cond:
+                    pending_cnt = len(bctx["pending"])
+                    in_flight_cnt = bctx["in_flight"]
+                    if not self.stop_requested and pending_cnt > 0:
+                        desired = min(self.get_target_browser_count(), len(ordered_accounts))
+                        needed_slots = min(desired, in_flight_cnt + pending_cnt)
+                        # Spawn lowest free slot_id while live slots < needed_slots
+                        while len(pool_state["live_slots"]) < needed_slots:
+                            free_id = next(s for s in range(len(ordered_accounts) + 4) if s not in pool_state["live_slots"])
+                            _spawn_slot(free_id)
+                        self._active_browser_count = len(pool_state["live_slots"])
+                    else:
+                        self._active_browser_count = len(pool_state["live_slots"])
+
+                    if pending_cnt == 0 and in_flight_cnt == 0:
+                        break
+                    if self.stop_requested and in_flight_cnt == 0:
+                        bctx["pending"].clear()
+                        break
+                    cond.wait(timeout=0.2)
+                self._update_browser_count_ui()
+        finally:
+            with cond:
+                pool_state["current_batch"] = None
+                cond.notify_all()
 
     def _next_unprocessed_pdf_batch(self, processed_row_ids):
         """Return (source_file, batch_row_indices) for the next queued PDF batch that has selected unprocessed rows."""
@@ -5431,47 +6760,82 @@ class CProSuiteApp:
             row["_checked"] = i in target_set
 
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=headless, slow_mo=20)
-                try:
-                    batch_num = 0
-                    while not self.stop_requested:
-                        # Start background OCR for any remaining/newly queued PDFs while C-PRO runs!
-                        self._ensure_background_pdf_extractor()
+            custom_check_pass = getattr(self._run_check_pass, "__func__", None) is not CProSuiteApp._run_check_pass
+            use_dynamic_pool = (not custom_check_pass) and len(active_accounts) > 1
+            if len(active_accounts) == 1 and self.get_target_browser_count() > 1:
+                self.log(
+                    f"[PARALLEL] Only 1 enabled account ('{active_accounts[0]['username']}'); "
+                    f"running 1 browser to prevent duplicate-login session kickout."
+                )
 
-                        source_file, batch_indices = self._next_unprocessed_pdf_batch(processed_row_ids)
-                        if not batch_indices:
-                            with self._pdf_queue_lock:
-                                bg_pending = self._bg_extract_active or bool(self._queued_pdf_paths)
-                            if bg_pending and not self.stop_requested:
-                                time.sleep(0.2)
-                                continue
-                            break
+            pool_state = {"current_batch": None, "shutdown": False, "live_slots": {}}
+            single_pw_ctx = None
+            single_browser = None
+            if not use_dynamic_pool:
+                single_pw_ctx = sync_playwright()
+                p = single_pw_ctx.__enter__()
+                single_browser = self._launch_browser_for_slot(p, headless=headless, slot_id=0, multi_window=False)
+                self._active_browser_count = 1
+                self._update_browser_count_ui()
+            else:
+                self.log(
+                    f"[PARALLEL] Multi-account pool ready ({len(active_accounts)} accounts, "
+                    f"target={self.get_target_browser_count()} browser(s)). You can switch 1 ↔ 2+ browsers anytime!"
+                )
 
-                        remaining_including_current = self._count_remaining_pdf_batches(processed_row_ids)
-                        batch_num += 1
-                        total_batches_est = (batch_num - 1) + remaining_including_current
+            try:
+                batch_num = 0
+                while not self.stop_requested:
+                    # Start background OCR for any remaining/newly queued PDFs while C-PRO runs!
+                    self._ensure_background_pdf_extractor()
 
-                        self.pdf_batch_status[source_file] = "Running"
-                        self._safe_ui_after(0, self._update_pdf_batch_selector)
-                        self.log(
-                            f"===================================================================="
-                        )
-                        self.log(
-                            f">>> [PDF BATCH {batch_num}/{total_batches_est}] Starting: {source_file} ({len(batch_indices)} case(s)) <<<"
-                        )
-                        self.log(
-                            f"===================================================================="
-                        )
-                        self.set_status(
-                            f"PDF {batch_num}/{total_batches_est}: {source_file} ({len(batch_indices)} cases)...",
-                            bg="#E8F8EE",
-                            fg=THEME["green"],
-                        )
+                    source_file, batch_indices = self._next_unprocessed_pdf_batch(processed_row_ids)
+                    if not batch_indices:
+                        with self._pdf_queue_lock:
+                            bg_pending = self._bg_extract_active or bool(self._queued_pdf_paths)
+                        if bg_pending and not self.stop_requested:
+                            time.sleep(0.2)
+                            continue
+                        break
 
-                        batch_detailed_log = []
+                    remaining_including_current = self._count_remaining_pdf_batches(processed_row_ids)
+                    batch_num += 1
+                    total_batches_est = (batch_num - 1) + remaining_including_current
+
+                    self.pdf_batch_status[source_file] = "Running"
+                    self._safe_ui_after(0, self._update_pdf_batch_selector)
+                    self.log(
+                        f"===================================================================="
+                    )
+                    self.log(
+                        f">>> [PDF BATCH {batch_num}/{total_batches_est}] Starting: {source_file} ({len(batch_indices)} case(s)) <<<"
+                    )
+                    self.log(
+                        f"===================================================================="
+                    )
+                    self.set_status(
+                        f"PDF {batch_num}/{total_batches_est}: {source_file} ({len(batch_indices)} cases)...",
+                        bg="#E8F8EE",
+                        fg=THEME["green"],
+                    )
+
+                    batch_detailed_log = []
+                    if use_dynamic_pool:
+                        self._run_dynamic_multi_browser_pass(
+                            pool_state=pool_state,
+                            active_accounts=active_accounts,
+                            active_sections=active_sections,
+                            pass_indices=batch_indices,
+                            found_tracker=found_tracker,
+                            detailed_log=batch_detailed_log,
+                            mode=mode,
+                            verify_mode=verify_mode,
+                            round_label=f"{source_file} - Initial",
+                            headless=headless,
+                        )
+                    else:
                         self._run_check_pass(
-                            browser=browser,
+                            browser=single_browser,
                             active_accounts=active_accounts,
                             active_sections=active_sections,
                             pass_indices=batch_indices,
@@ -5483,32 +6847,46 @@ class CProSuiteApp:
                             session_pool=session_pool,
                         )
 
-                        initial_errors = sum(
-                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
-                        )
-                        for recovery_round in range(1, MAX_ERROR_RECOVERY_ROUNDS + 1):
-                            if self.stop_requested:
-                                break
-                            error_indices = [
-                                idx for idx in batch_indices
-                                if self.cases_data[idx].get("Availability Status") == "CHECK ERROR"
-                            ]
-                            if not error_indices:
-                                if initial_errors > 0:
-                                    recovery_resolved = True
-                                break
+                    initial_errors = sum(
+                        1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
+                    )
+                    for recovery_round in range(1, MAX_ERROR_RECOVERY_ROUNDS + 1):
+                        if self.stop_requested:
+                            break
+                        error_indices = [
+                            idx for idx in batch_indices
+                            if self.cases_data[idx].get("Availability Status") == "CHECK ERROR"
+                        ]
+                        if not error_indices:
+                            if initial_errors > 0:
+                                recovery_resolved = True
+                            break
 
-                            self.log(
-                                f"[RECOVERY] [{source_file}] Found {len(error_indices)} CHECK ERROR case(s). "
-                                f"Re-checking all enabled account(s) & section(s) (Round {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS})..."
+                        self.log(
+                            f"[RECOVERY] [{source_file}] Found {len(error_indices)} CHECK ERROR case(s). "
+                            f"Re-checking all enabled account(s) & section(s) (Round {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS})..."
+                        )
+                        self.set_status(
+                            f"PDF {batch_num}/{total_batches_est} ({source_file}): Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}...",
+                            bg="#FFF4D6",
+                            fg="#8A5A00",
+                        )
+                        if use_dynamic_pool:
+                            self._run_dynamic_multi_browser_pass(
+                                pool_state=pool_state,
+                                active_accounts=active_accounts,
+                                active_sections=active_sections,
+                                pass_indices=error_indices,
+                                found_tracker=found_tracker,
+                                detailed_log=batch_detailed_log,
+                                mode=mode,
+                                verify_mode=verify_mode,
+                                round_label=f"{source_file} - Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}",
+                                headless=headless,
                             )
-                            self.set_status(
-                                f"PDF {batch_num}/{total_batches_est} ({source_file}): Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}...",
-                                bg="#FFF4D6",
-                                fg="#8A5A00",
-                            )
+                        else:
                             self._run_check_pass(
-                                browser=browser,
+                                browser=single_browser,
                                 active_accounts=active_accounts,
                                 active_sections=active_sections,
                                 pass_indices=error_indices,
@@ -5519,59 +6897,100 @@ class CProSuiteApp:
                                 round_label=f"{source_file} - Recovery {recovery_round}/{MAX_ERROR_RECOVERY_ROUNDS}",
                                 session_pool=session_pool,
                             )
-                        else:
-                            if initial_errors > 0 and not any(
-                                self.cases_data[i].get("Availability Status") == "CHECK ERROR" for i in batch_indices
-                            ):
-                                recovery_resolved = True
+                    else:
+                        if initial_errors > 0 and not any(
+                            self.cases_data[i].get("Availability Status") == "CHECK ERROR" for i in batch_indices
+                        ):
+                            recovery_resolved = True
 
-                        for b_idx in batch_indices:
-                            processed_row_ids.add(id(self.cases_data[b_idx]))
-                        all_processed_indices.extend(batch_indices)
-                        all_detailed_log.extend(batch_detailed_log)
+                    for b_idx in batch_indices:
+                        processed_row_ids.add(id(self.cases_data[b_idx]))
+                    all_processed_indices.extend(batch_indices)
+                    all_detailed_log.extend(batch_detailed_log)
 
-                        # Save this PDF batch's own extracted Excel and its own C-PRO report Excel immediately!
-                        self._save_extracted_excel(target_source_file=source_file)
-                        batch_rows = [
-                            row for row in self.cases_data if self._row_source_key(row) == source_file
-                        ]
-                        per_pdf_pref = self._get_report_excel_path(source_file)
-                        per_pdf_report_path = self._save_report_excel_for_rows(
-                            batch_rows,
-                            batch_detailed_log,
-                            per_pdf_pref,
-                            f"C-PRO report for {source_file}",
-                        )
-                        self.report_excel_paths[source_file] = per_pdf_report_path
-                        self.last_report_path = per_pdf_report_path
-                        batch_err_cnt = sum(
-                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
-                        )
-                        batch_ok_cnt = sum(
-                            1 for i in batch_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE")
-                        )
-                        self.pdf_batch_status[source_file] = "Has Errors" if batch_err_cnt else "Completed"
+                    # Save this PDF batch's C-PRO Availability Report Excel & persist checking condition (no extracted_cases Excel!)
+                    det_map = getattr(self, "detailed_logs_by_source", None)
+                    if isinstance(det_map, dict):
+                        src_det_list = det_map.setdefault(source_file, [])
+                        src_det_list.extend(batch_detailed_log)
+                    else:
+                        src_det_list = batch_detailed_log
+
+                    batch_rows = [
+                        row for row in self.cases_data if self._row_source_key(row) == source_file
+                    ]
+                    per_pdf_pref = self._get_report_excel_path(source_file)
+                    per_pdf_report_path = self._save_report_excel_for_rows(
+                        batch_rows,
+                        src_det_list,
+                        per_pdf_pref,
+                        f"C-PRO report for {source_file}",
+                    )
+                    self.report_excel_paths[source_file] = per_pdf_report_path
+                    self.last_report_path = per_pdf_report_path
+                    batch_err_cnt = sum(
+                        1 for i in batch_indices if self.cases_data[i].get("Availability Status") == "CHECK ERROR"
+                    )
+                    batch_ok_cnt = sum(
+                        1 for i in batch_indices if self.cases_data[i].get("Availability Status") in ("COMPLETE", "AVAILABLE")
+                    )
+                    self.pdf_batch_status[source_file] = self._infer_pdf_batch_status(source_file)
+                    if not self.stop_requested:
                         self._archive_completed_pdf_if_enabled(source_file, batch_indices)
-                        self._safe_ui_after(0, self._update_pdf_batch_selector)
-                        batch_reports.append((source_file, len(batch_indices), batch_ok_cnt, batch_err_cnt, per_pdf_report_path))
-                        self.log(
-                            f">>> [PDF BATCH {batch_num}/{total_batches_est} DONE] {source_file}: "
-                            f"{batch_ok_cnt}/{len(batch_indices)} complete -> Report saved to '{per_pdf_report_path}' <<<"
-                        )
-                finally:
-                    for sess in session_pool.values():
-                        try:
-                            if sess.get("context") is not None:
-                                sess["context"].close()
-                        except Exception:
-                            pass
-                    session_pool.clear()
-                    browser.close()
+                    self._save_check_state()
+                    self._safe_ui_after(0, self._update_pdf_batch_selector)
+                    batch_reports.append((source_file, len(batch_indices), batch_ok_cnt, batch_err_cnt, per_pdf_report_path))
+                    self.log(
+                        f">>> [PDF BATCH {batch_num}/{total_batches_est} DONE] {source_file}: "
+                        f"{batch_ok_cnt}/{len(batch_indices)} complete -> Report saved to '{per_pdf_report_path}' <<<"
+                    )
+            finally:
+                cond = self._get_pool_cond()
+                with cond:
+                    pool_state["shutdown"] = True
+                    cond.notify_all()
+                    slot_threads = list(pool_state["live_slots"].values())
+                for st in slot_threads:
+                    st.join(timeout=15)
+                for sess in session_pool.values():
+                    try:
+                        if sess.get("context") is not None:
+                            sess["context"].close()
+                    except Exception:
+                        pass
+                session_pool.clear()
+                if single_browser is not None:
+                    try:
+                        single_browser.close()
+                    except Exception:
+                        pass
+                if single_pw_ctx is not None:
+                    try:
+                        single_pw_ctx.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                self._active_browser_count = 0
+                self._update_browser_count_ui()
+                self._save_check_state()
 
-            # Also save master combined report across all rows
+            # Also save master combined report across all rows (preserving accumulated per-source details across restarts)
+            det_map = getattr(self, "detailed_logs_by_source", None)
+            if isinstance(det_map, dict) and det_map:
+                master_detailed = []
+                seen_sources = set()
+                for src in self._get_ordered_source_files():
+                    if src in det_map:
+                        master_detailed.extend(det_map[src])
+                        seen_sources.add(src)
+                for src, entries in det_map.items():
+                    if src not in seen_sources:
+                        master_detailed.extend(entries)
+            else:
+                master_detailed = all_detailed_log
+
             master_report_path = self._save_report_excel_for_rows(
                 self.cases_data,
-                all_detailed_log,
+                master_detailed,
                 REPORT_EXCEL,
                 "C-PRO master availability report",
             )
